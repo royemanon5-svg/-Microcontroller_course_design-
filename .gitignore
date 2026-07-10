@@ -1,0 +1,31 @@
+# Build outputs
+**/Objects/
+**/Listings/
+**/Debug/
+**/Release/
+**/MDK-ARM/*/*.o
+**/MDK-ARM/*/*.d
+**/MDK-ARM/*/*.crf
+**/MDK-ARM/*/*.map
+**/MDK-ARM/*/*.lst
+*.lst
+**/MDK-ARM/*/*.lnp
+**/MDK-ARM/*/*.axf
+**/MDK-ARM/*/*.hex
+**/MDK-ARM/*/*.htm
+**/MDK-ARM/*/*.dep
+**/MDK-ARM/*/*.iex
+
+# Keil user/local files
+*.uvguix.*
+*.uvgui.*
+*.uvoptx
+*.uvopt
+*.bak
+*.Bak
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
