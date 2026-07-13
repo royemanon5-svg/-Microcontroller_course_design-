@@ -42,6 +42,10 @@ void Motor_SetPWM(int16_t PWML, int16_t PWMR)
     if(PWMR > 999)  PWMR = 999;
     if(PWMR < -999) PWMR = -999;
 
+    // 后车两侧电机安装方向与驱动正方向相反，统一翻转为“正值向前”
+    PWML = (int16_t)-PWML;
+    PWMR = (int16_t)-PWMR;
+
     // --- 左电机控制 (PA2, PA3) ---
     if (PWML > 0)
     {

@@ -25,5 +25,6 @@ NRF24L01_Status NRF24L01_Init(void);
 NRF24L01_Status NRF24L01_ReadPacket(NRF24L01_Packet *packet);
 uint8_t NRF24L01_IsConnected(uint32_t now_ms);
 uint32_t NRF24L01_LastPacketTick(void);
+uint8_t NRF24L01_ReadRegister(uint8_t reg);
 
 #endif

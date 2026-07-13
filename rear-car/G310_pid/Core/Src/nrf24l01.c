@@ -30,6 +30,9 @@ extern SPI_HandleTypeDef hspi2;
 
 static const uint8_t rx_address[5] = {'C', 'A', 'R', '0', '1'};
 static uint32_t last_packet_tick = 0;
+static uint8_t module_ready = 0U;
+static uint8_t last_sequence = 0U;
+static uint8_t sequence_valid = 0U;
 //CSN = 0：选中 NRF24L01，开始 SPI 通信  CSN = 1：取消选中
 static void csn_low(void)
 {
@@ -69,6 +72,11 @@ static uint8_t read_register(uint8_t reg)
     csn_high();
 
     return rx[1];
+}
+
+uint8_t NRF24L01_ReadRegister(uint8_t reg)
+{
+    return read_register(reg);
 }
 //写寄存器
 static NRF24L01_Status write_register(uint8_t reg, uint8_t value)
@@ -134,6 +142,10 @@ static uint8_t checksum7(const uint8_t *data)
 //初始化接收模式
 NRF24L01_Status NRF24L01_Init(void)
 {
+    module_ready = 0U;
+    last_packet_tick = 0U;
+    sequence_valid = 0U;
+
     ce_low(); // CE引脚拉低 → NRF进入待机模式（先别工作）
     csn_high(); // CSN引脚拉高 → SPI片选无效（先别通信）
     HAL_Delay(5);// 等5ms → 让NRF稳定上电
@@ -142,7 +154,8 @@ NRF24L01_Status NRF24L01_Init(void)
         return NRF24L01_SPI_ERROR;
     }
 		
-    write_register(NRF_REG_EN_AA, 0x01U);//0x01U = 0000 0001，只对管道0(Pipe0)开启自动应答
+    /* Match the front car's one-way telemetry mode (no auto-ack). */
+    write_register(NRF_REG_EN_AA, 0x00U);
     write_register(NRF_REG_EN_RXADDR, 0x01U);//只使能管道0(Pipe0)接收数据
     write_register(NRF_REG_SETUP_AW, 0x03U);
     write_register(NRF_REG_SETUP_RETR, 0x00U);//自动重传 关闭
@@ -160,7 +173,7 @@ NRF24L01_Status NRF24L01_Init(void)
     HAL_Delay(2);
     ce_high();
 
-    last_packet_tick = 0;
+    module_ready = 1U;
     return NRF24L01_OK;
 }
 
@@ -174,7 +187,7 @@ NRF24L01_Status NRF24L01_ReadPacket(NRF24L01_Packet *packet)
     uint8_t i;
     NRF24L01_Status ret;
 
-    if (packet == 0) {
+    if ((packet == 0) || (module_ready == 0U)) {
         return NRF24L01_SPI_ERROR;
     }
 
@@ -203,6 +216,14 @@ NRF24L01_Status NRF24L01_ReadPacket(NRF24L01_Packet *packet)
         payload[i] = rx[i + 1U];
     }
 
+    /* A failed/floating SPI read often returns a complete all-zero payload. */
+    if ((payload[0] == 0U) && (payload[1] == 0U) &&
+        (payload[2] == 0U) && (payload[3] == 0U) &&
+        (payload[4] == 0U) && (payload[5] == 0U) &&
+        (payload[6] == 0U) && (payload[7] == 0U)) {
+        return NRF24L01_SPI_ERROR;
+    }
+
     if (checksum7(payload) != payload[7]) {
         return NRF24L01_CHECKSUM_ERROR;
     }
@@ -212,6 +233,14 @@ NRF24L01_Status NRF24L01_ReadPacket(NRF24L01_Packet *packet)
     packet->yaw = (int16_t)((uint16_t)payload[4] | ((uint16_t)payload[5] << 8));
     packet->seq = payload[6];
     packet->checksum = payload[7];
+
+    /* A packet already read from the FIFO must not keep the link alive. */
+    if ((sequence_valid != 0U) && (packet->seq == last_sequence)) {
+        return NRF24L01_NO_DATA;
+    }
+
+    last_sequence = packet->seq;
+    sequence_valid = 1U;
     last_packet_tick = HAL_GetTick();//记录收到时间
 
     return NRF24L01_OK;

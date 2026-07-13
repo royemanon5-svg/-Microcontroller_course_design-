@@ -197,6 +197,8 @@ int main(void)
     }
     {
         static uint32_t last_nrf_retry = 0U;
+        static uint32_t last_nrf_send = 0U;
+        uint32_t now = HAL_GetTick();
         int16_t left = g_motor_cmd_left;
         int16_t right = g_motor_cmd_right;
         int16_t speed = (int16_t)(((int32_t)left + right) / 2);
@@ -209,14 +211,16 @@ int main(void)
 
         if (g_nrf_ready)
         {
-            g_nrf_tx_ok = (NRF24L01_SendCarData(speed, turn, yaw_x10) == NRF24L01_TX_OK);
+            if ((uint32_t)(now - last_nrf_send) >= 20U)
+            {
+                last_nrf_send = now;
+                g_nrf_tx_ok = (NRF24L01_SendCarData(speed, turn, yaw_x10) == NRF24L01_TX_OK);
+            }
             OLED_ShowString(2, 1, g_nrf_tx_ok ? "RF:OK Q:   " : "RF:ERR Q:  ");
             OLED_ShowNum(2, 9, NRF24L01_LastSequence(), 3);
         }
         else
         {
-            uint32_t now = HAL_GetTick();
-
             if ((uint32_t)(now - last_nrf_retry) >= 500U)
             {
                 last_nrf_retry = now;

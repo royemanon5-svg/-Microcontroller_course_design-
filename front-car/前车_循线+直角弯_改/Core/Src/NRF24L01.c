@@ -115,10 +115,11 @@ uint8_t NRF24L01_Init(void)
     HAL_Delay(5);
 
     nrf_write_register(NRF_REG_CONFIG, 0x0EU);
-    nrf_write_register(NRF_REG_EN_AA, 0x01U);
+    /* Telemetry is one-way; do not make transmission depend on an ACK. */
+    nrf_write_register(NRF_REG_EN_AA, 0x00U);
     nrf_write_register(NRF_REG_EN_RXADDR, 0x01U);
     nrf_write_register(NRF_REG_SETUP_AW, 0x03U);
-    nrf_write_register(NRF_REG_SETUP_RETR, 0x13U);
+    nrf_write_register(NRF_REG_SETUP_RETR, 0x00U);
     nrf_write_register(NRF_REG_RF_CH, 40U);
     nrf_write_register(NRF_REG_RF_SETUP, 0x06U);
     nrf_write_register(NRF_REG_RX_PW_P0, NRF24L01_PAYLOAD_SIZE);
