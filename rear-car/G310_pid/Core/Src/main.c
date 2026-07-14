@@ -65,11 +65,13 @@ typedef struct {
 #define FOLLOW_MIN_DRIVE_PWM    20
 #define FOLLOW_TURN_DETECT_PWM  40
 #define FOLLOW_PIVOT_TURN_PWM   60
-#define FOLLOW_PREVIEW_DISTANCE_MM 15U
+#define FOLLOW_PREVIEW_DISTANCE_MM 5U
 #define FOLLOW_EFFECTIVE_TRACK_MM 110.0f
-#define FOLLOW_CURVATURE_BLEND_PERCENT 60
+#define FOLLOW_CURVATURE_BLEND_PERCENT 10
 #define FOLLOW_CURVATURE_MIN_YAW_DEG 0.5f
-#define FOLLOW_TURN_SLEW_PWM    25
+#define FOLLOW_TURN_RISE_SLEW_PWM 25
+#define FOLLOW_TURN_FALL_SLEW_PWM 80
+#define FOLLOW_TURN_BRAKE_ANGLE_DEG 25.0f
 #define FRONT_YAW_SIGN          1.0f
 #define REAR_YAW_SIGN           1.0f
 #define FOLLOW_CONTROL_MS       10U
@@ -555,6 +557,7 @@ static void RearCar_ControlTask(void)
     int16_t target_turn_pwm;
     int16_t turn_pwm;
     int16_t turn_slew_delta;
+    int16_t turn_slew_limit;
     int16_t steering_pwm;
     int16_t steering_limit;
     int16_t base_abs;
@@ -681,17 +684,36 @@ static void RearCar_ControlTask(void)
         target_turn_pwm = 0;
     }
 
-    /* Do not keep steering after reaching the yaw of this path point. */
+    /* Reduce feedforward before the current path point's yaw is reached. */
+    if ((target_turn_pwm != 0) &&
+        (fabsf(heading_error) < FOLLOW_TURN_BRAKE_ANGLE_DEG)) {
+        target_turn_pwm = (int16_t)(
+            (float)target_turn_pwm * fabsf(heading_error) /
+            FOLLOW_TURN_BRAKE_ANGLE_DEG);
+    }
+
+    /* Cut feedforward immediately after reaching or crossing target yaw. */
     if (((target_turn_pwm > 0) && (heading_error <= 0.0f)) ||
         ((target_turn_pwm < 0) && (heading_error >= 0.0f))) {
         target_turn_pwm = 0;
+        last_turn_feedforward_pwm = 0;
     }
 
     turn_slew_delta = (int16_t)(target_turn_pwm -
                                 last_turn_feedforward_pwm);
+    turn_slew_limit = ((target_turn_pwm == 0) ||
+                       (((target_turn_pwm > 0) ==
+                         (last_turn_feedforward_pwm > 0)) &&
+                        (((target_turn_pwm < 0) ? -target_turn_pwm :
+                          target_turn_pwm) <
+                         ((last_turn_feedforward_pwm < 0) ?
+                          -last_turn_feedforward_pwm :
+                          last_turn_feedforward_pwm)))) ?
+                      FOLLOW_TURN_FALL_SLEW_PWM :
+                      FOLLOW_TURN_RISE_SLEW_PWM;
     turn_slew_delta = clamp_i16(turn_slew_delta,
-                                -FOLLOW_TURN_SLEW_PWM,
-                                FOLLOW_TURN_SLEW_PWM);
+                                -turn_slew_limit,
+                                turn_slew_limit);
     turn_pwm = (int16_t)(last_turn_feedforward_pwm + turn_slew_delta);
     last_turn_feedforward_pwm = turn_pwm;
 
