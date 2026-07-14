@@ -49,16 +49,16 @@ typedef struct {
 /* USER CODE BEGIN PD */
 #define FOLLOW_VALID_MIN_CM     3
 #define FOLLOW_VALID_MAX_CM     80
+#define FOLLOW_CONTROL_MIN_CM   10
+#define FOLLOW_CONTROL_MAX_CM   35
 #define FOLLOW_START_DISTANCE_CM 20
 #define FOLLOW_START_CONFIRM_N  3U
 #define FOLLOW_DISTANCE_TARGET_CM 20
 #define FOLLOW_DISTANCE_DEADBAND_CM 2
 #define FOLLOW_DISTANCE_KP      8.0f
 #define FOLLOW_DISTANCE_MAX_PWM 80
-#define FOLLOW_DISTANCE_STABLE_N 3U
+#define FOLLOW_DISTANCE_STABLE_N 2U
 #define FOLLOW_DISTANCE_MAX_JUMP_CM 4U
-#define FOLLOW_DISTANCE_ESTIMATE_TOLERANCE_MM 100
-#define FOLLOW_DISTANCE_HEADING_MAX_DEG 8.0f
 #define FOLLOW_MAX_BASE_PWM     999
 #define FOLLOW_MAX_TURN_PWM     999
 #define FOLLOW_MAX_HEADING_PWM  120
@@ -86,7 +86,7 @@ typedef struct {
 /* Calibrate odometry here instead of changing the rear-car PWM. */
 #define REAR_PATH_SCALE_NUM     1000U
 #define REAR_PATH_SCALE_DEN     1000U
-#define FOLLOW_PLAYBACK_DELAY_MM 20U
+#define FOLLOW_PLAYBACK_DELAY_MM 158U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -122,8 +122,6 @@ static volatile uint32_t rear_odometer_ticks = 0U;
 static volatile uint8_t rear_path_half_tick = 0U;
 static volatile uint8_t rear_odometer_half_tick = 0U;
 static uint64_t front_path_origin_um = 0U;
-static uint32_t front_start_path_mm = 0U;
-static uint16_t spacing_reference_mm = 200U;
 static uint8_t distance_stable_count = 0U;
 static uint16_t last_raw_distance_cm = 0U;
 static int16_t distance_trim_pwm = 0;
@@ -163,9 +161,7 @@ static uint8_t TrackBuffer_GetPlayback(NRF24L01_Packet *packet);
 static uint8_t TrackBuffer_GetYawAt(uint64_t target_front_um,
                                     int16_t *yaw_x10);
 static void RearCar_RecordPacket(const NRF24L01_Packet *packet);
-static int32_t RearCar_EstimatedGapMm(void);
-static uint8_t RearCar_CanUseUltrasonic(uint8_t turning_command,
-                                        float heading_error);
+static uint8_t RearCar_CanUseUltrasonic(uint8_t turning_command);
 static void RearCar_UpdateDistanceTrim(uint8_t trusted);
 static void RearCar_ControlTask(void);
 static void RearCar_UpdateOLED(void);
@@ -320,12 +316,6 @@ static uint8_t TrackBuffer_StartPlayback(void)
     front_path_origin_um = ticks_to_um(track_buffer[track_tail].packet.path_ticks,
                                       FRONT_TICKS_TO_MM_NUM,
                                       FRONT_TICKS_TO_MM_DEN);
-    front_start_path_mm = ticks_to_mm(car.radio.path_ticks,
-                                     FRONT_TICKS_TO_MM_NUM,
-                                     FRONT_TICKS_TO_MM_DEN);
-    spacing_reference_mm = car.distance_valid ?
-                           (uint16_t)(car.distance_cm * 10U) :
-                           (uint16_t)(FOLLOW_DISTANCE_TARGET_CM * 10U);
     rear_path_ticks = 0U;
     rear_path_half_tick = 0U;
     playback_anchor_valid = 0U;
@@ -475,41 +465,15 @@ static void RearCar_RecordPacket(const NRF24L01_Packet *packet)
     }
 }
 
-static int32_t RearCar_EstimatedGapMm(void)
+static uint8_t RearCar_CanUseUltrasonic(uint8_t turning_command)
 {
-    uint32_t front_now_mm = ticks_to_mm(car.radio.path_ticks,
-                                        FRONT_TICKS_TO_MM_NUM,
-                                        FRONT_TICKS_TO_MM_DEN);
-    uint32_t rear_now_mm = ticks_to_mm(rear_path_ticks,
-                                       REAR_TICKS_TO_MM_NUM,
-                                       REAR_TICKS_TO_MM_DEN);
-
-    return (int32_t)spacing_reference_mm +
-           (int32_t)front_now_mm - (int32_t)front_start_path_mm -
-           (int32_t)rear_now_mm;
-}
-
-static uint8_t RearCar_CanUseUltrasonic(uint8_t turning_command,
-                                        float heading_error)
-{
-    int32_t measured_gap_mm;
-    int32_t estimated_gap_mm;
-    int32_t gap_difference_mm;
-
     if ((turning_command != 0U) || (car.distance_valid == 0U) ||
         (distance_stable_count < FOLLOW_DISTANCE_STABLE_N) ||
-        (fabsf(heading_error) > FOLLOW_DISTANCE_HEADING_MAX_DEG)) {
+        (car.distance_cm < FOLLOW_CONTROL_MIN_CM) ||
+        (car.distance_cm > FOLLOW_CONTROL_MAX_CM)) {
         return 0U;
     }
-
-    measured_gap_mm = (int32_t)car.distance_cm * 10;
-    estimated_gap_mm = RearCar_EstimatedGapMm();
-    gap_difference_mm = measured_gap_mm - estimated_gap_mm;
-    if (gap_difference_mm < 0) {
-        gap_difference_mm = -gap_difference_mm;
-    }
-
-    return (gap_difference_mm <= FOLLOW_DISTANCE_ESTIMATE_TOLERANCE_MM) ? 1U : 0U;
+    return 1U;
 }
 
 static void RearCar_UpdateDistanceTrim(uint8_t trusted)
@@ -723,8 +687,7 @@ static void RearCar_ControlTask(void)
     turn_pwm = (int16_t)(last_turn_feedforward_pwm + turn_slew_delta);
     last_turn_feedforward_pwm = turn_pwm;
 
-    RearCar_UpdateDistanceTrim(
-        RearCar_CanUseUltrasonic(turning_command, heading_error));
+    RearCar_UpdateDistanceTrim(RearCar_CanUseUltrasonic(turning_command));
     base_pwm = clamp_i16((int32_t)base_pwm + distance_trim_pwm,
                          -FOLLOW_MAX_BASE_PWM,
                          FOLLOW_MAX_BASE_PWM);
