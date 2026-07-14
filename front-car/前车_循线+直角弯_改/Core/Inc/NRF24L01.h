@@ -3,7 +3,7 @@
 
 #include "main.h"
 
-#define NRF24L01_PAYLOAD_SIZE  8U
+#define NRF24L01_PAYLOAD_SIZE  12U
 
 typedef enum
 {
@@ -15,7 +15,8 @@ typedef enum
 uint8_t NRF24L01_Init(void);
 NRF24L01_TxResult NRF24L01_SendCarData(int16_t speed,
                                       int16_t turn,
-                                      int16_t yaw_x10);
+                                      int16_t yaw_x10,
+                                      uint32_t path_ticks);
 uint8_t NRF24L01_ReadRegister(uint8_t reg);
 uint8_t NRF24L01_LastSequence(void);
 

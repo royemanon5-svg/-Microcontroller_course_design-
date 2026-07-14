@@ -4,6 +4,8 @@
 extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim3;
 extern TIM_HandleTypeDef htim4;
+
+#define FRONT_MOTOR_PWM_ENABLED 1U
 /**
   * @brief 电机初始化：启动 PWM 信号，初始状态停止
   */
@@ -36,6 +38,19 @@ void Get_Motor_Speed(int16_t *leftSpeed, int16_t *rightSpeed)
 }
 void Motor_SetPWM(int16_t PWML, int16_t PWMR)
 {
+    if (FRONT_MOTOR_PWM_ENABLED == 0U)
+    {
+        HAL_GPIO_WritePin(MOTOR_A_PORT,
+                          MOTOR_AIN1_PIN | MOTOR_AIN2_PIN,
+                          GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_B_PORT,
+                          MOTOR_BIN1_PIN | MOTOR_BIN2_PIN,
+                          GPIO_PIN_RESET);
+        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0U);
+        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0U);
+        return;
+    }
+
     // 1. 限幅处理 (假设 ARR 设置为 999)
     if(PWML > 999)  PWML = 999;
     if(PWML < -999) PWML = -999;

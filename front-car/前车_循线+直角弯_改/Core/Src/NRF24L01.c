@@ -137,7 +137,8 @@ uint8_t NRF24L01_Init(void)
 
 NRF24L01_TxResult NRF24L01_SendCarData(int16_t speed,
                                       int16_t turn,
-                                      int16_t yaw_x10)
+                                      int16_t yaw_x10,
+                                      uint32_t path_ticks)
 {
     uint8_t payload[NRF24L01_PAYLOAD_SIZE];
     uint8_t checksum = 0U;
@@ -149,13 +150,17 @@ NRF24L01_TxResult NRF24L01_SendCarData(int16_t speed,
     payload[3] = (uint8_t)((uint16_t)turn >> 8);
     payload[4] = (uint8_t)yaw_x10;
     payload[5] = (uint8_t)((uint16_t)yaw_x10 >> 8);
-    payload[6] = tx_sequence++;
-    last_tx_sequence = payload[6];
-    for (uint8_t i = 0U; i < 7U; i++)
+    payload[6] = (uint8_t)path_ticks;
+    payload[7] = (uint8_t)(path_ticks >> 8);
+    payload[8] = (uint8_t)(path_ticks >> 16);
+    payload[9] = (uint8_t)(path_ticks >> 24);
+    payload[10] = tx_sequence++;
+    last_tx_sequence = payload[10];
+    for (uint8_t i = 0U; i < (NRF24L01_PAYLOAD_SIZE - 1U); i++)
     {
         checksum = (uint8_t)(checksum + payload[i]);
     }
-    payload[7] = checksum;
+    payload[11] = checksum;
 
     HAL_GPIO_WritePin(CE_GPIO_Port, CE_Pin, GPIO_PIN_RESET);
     nrf_write_register(NRF_REG_STATUS, NRF_STATUS_IRQ_MASK);

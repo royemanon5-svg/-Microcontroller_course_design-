@@ -32,7 +32,6 @@ typedef enum {
 
 typedef struct {
     NRF24L01_Packet packet;
-    uint32_t rx_tick;
 } TrackPoint;
 
 typedef struct {
@@ -53,12 +52,18 @@ typedef struct {
 #define FOLLOW_VALID_MAX_CM     80
 #define FOLLOW_START_DISTANCE_CM 15
 #define FOLLOW_START_CONFIRM_N  3U
-#define FOLLOW_HEADING_KP       2.0f
-#define FOLLOW_TURN_FF_GAIN     1.0f
+#define FOLLOW_DISTANCE_ONLY_TEST 0U
+#define FOLLOW_DISTANCE_TARGET_CM 20
+#define FOLLOW_DISTANCE_DEADBAND_CM 1
+#define FOLLOW_DISTANCE_KP      10.0f
+#define FOLLOW_DISTANCE_MAX_PWM 120
+#define FOLLOW_DISTANCE_TEST_MIN_PWM 100
+#define FOLLOW_DISTANCE_TEST_MAX_PWM 300
 #define FOLLOW_MAX_BASE_PWM     999
 #define FOLLOW_MAX_TURN_PWM     999
 #define FOLLOW_MAX_HEADING_PWM  120
 #define FOLLOW_MIN_DRIVE_PWM    20
+#define FOLLOW_TURN_DETECT_PWM  40
 #define FOLLOW_PIVOT_TURN_PWM   60
 #define FRONT_YAW_SIGN          1.0f
 #define REAR_YAW_SIGN           1.0f
@@ -66,6 +71,10 @@ typedef struct {
 #define FOLLOW_DISTANCE_MS      50U
 #define FOLLOW_OLED_MS          200U
 #define TRACK_BUFFER_SIZE       256U
+/* Delay trajectory playback by about 2 cm (37.53 encoder ticks/cm). */
+#define FOLLOW_INITIAL_OFFSET_TICKS 75U
+#define FOLLOW_PATH_SCALE_NUM   1U
+#define FOLLOW_PATH_SCALE_DEN   1U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -92,10 +101,13 @@ static uint16_t track_head = 0U;
 static uint16_t track_tail = 0U;
 static uint16_t track_count = 0U;
 static uint8_t front_motion_seen = 0U;
-static uint8_t playback_active = 0U;
+static volatile uint8_t playback_active = 0U;
 static uint8_t start_distance_count = 0U;
-static uint32_t playback_record_tick = 0U;
-static uint32_t playback_start_tick = 0U;
+static volatile uint32_t rear_path_ticks = 0U;
+static volatile uint32_t rear_odometer_ticks = 0U;
+static volatile uint8_t rear_path_half_tick = 0U;
+static volatile uint8_t rear_odometer_half_tick = 0U;
+static uint32_t front_path_origin = 0U;
 static float rear_target_yaw = 0.0f;
 static float front_yaw_reference = 0.0f;
 static float rear_yaw_reference = 0.0f;
@@ -116,9 +128,10 @@ static float angle_error_deg(float target, float current);
 static float normalize_angle_deg(float angle);
 static uint8_t RearCar_IsDistanceValid(uint16_t distance_cm);
 static void TrackBuffer_Reset(void);
-static void TrackBuffer_Push(const NRF24L01_Packet *packet, uint32_t rx_tick);
-static uint8_t TrackBuffer_StartPlayback(uint32_t now);
-static uint8_t TrackBuffer_GetPlayback(uint32_t now, NRF24L01_Packet *packet);
+static void TrackBuffer_Push(const NRF24L01_Packet *packet);
+static uint8_t TrackBuffer_StartPlayback(void);
+static uint8_t TrackBuffer_GetPlayback(NRF24L01_Packet *packet);
+static void RearCar_DistanceTestTask(void);
 static void RearCar_ControlTask(void);
 static void RearCar_UpdateOLED(void);
 /* USER CODE END PFP */
@@ -183,12 +196,13 @@ static void TrackBuffer_Reset(void)
     track_tail = 0U;
     track_count = 0U;
     playback_active = 0U;
+    rear_path_ticks = 0U;
+    rear_path_half_tick = 0U;
 }
 
-static void TrackBuffer_Push(const NRF24L01_Packet *packet, uint32_t rx_tick)
+static void TrackBuffer_Push(const NRF24L01_Packet *packet)
 {
     track_buffer[track_head].packet = *packet;
-    track_buffer[track_head].rx_tick = rx_tick;
     track_head = (uint16_t)((track_head + 1U) % TRACK_BUFFER_SIZE);
 
     if (track_count < TRACK_BUFFER_SIZE) {
@@ -199,36 +213,46 @@ static void TrackBuffer_Push(const NRF24L01_Packet *packet, uint32_t rx_tick)
     }
 }
 
-static uint8_t TrackBuffer_StartPlayback(uint32_t now)
+static uint8_t TrackBuffer_StartPlayback(void)
 {
     if (track_count == 0U) {
         return 0U;
     }
 
-    playback_record_tick = track_buffer[track_tail].rx_tick;
-    playback_start_tick = now;
+    front_path_origin = track_buffer[track_tail].packet.path_ticks;
+    rear_path_ticks = 0U;
+    rear_path_half_tick = 0U;
     playback_active = 1U;
     return 1U;
 }
 
-static uint8_t TrackBuffer_GetPlayback(uint32_t now, NRF24L01_Packet *packet)
+static uint8_t TrackBuffer_GetPlayback(NRF24L01_Packet *packet)
 {
-    uint32_t playback_elapsed;
-    uint32_t target_record_tick;
+    uint32_t rear_ticks;
+    uint32_t scaled_ticks;
+    uint32_t target_front_ticks;
     uint8_t updated = 0U;
 
     if ((playback_active == 0U) || (packet == 0)) {
         return 0U;
     }
 
-    playback_elapsed = (uint32_t)(now - playback_start_tick);
-    target_record_tick = playback_record_tick + playback_elapsed;
+    rear_ticks = rear_path_ticks;
+    scaled_ticks = (rear_ticks / FOLLOW_PATH_SCALE_DEN) * FOLLOW_PATH_SCALE_NUM;
+    scaled_ticks += ((rear_ticks % FOLLOW_PATH_SCALE_DEN) *
+                     FOLLOW_PATH_SCALE_NUM) / FOLLOW_PATH_SCALE_DEN;
+    if (scaled_ticks > FOLLOW_INITIAL_OFFSET_TICKS) {
+        target_front_ticks = front_path_origin +
+                             (scaled_ticks - FOLLOW_INITIAL_OFFSET_TICKS);
+    } else {
+        target_front_ticks = front_path_origin;
+    }
 
-    /* Consume due packets in order; hold the last command across packet loss. */
+    /* Execute each front command when the rear car reaches the same wheel path. */
     while (track_count > 0U) {
         TrackPoint *point = &track_buffer[track_tail];
 
-        if ((int32_t)(target_record_tick - point->rx_tick) < 0) {
+        if ((int32_t)(target_front_ticks - point->packet.path_ticks) < 0) {
             break;
         }
 
@@ -247,6 +271,57 @@ static void RearCar_Stop(void)
     car.right_pwm = 0;
     car.mode = REAR_MODE_STOP;
     Motor_SetPWM(0, 0);
+    HeadingPID_Reset();
+}
+
+static void RearCar_DistanceTestTask(void)
+{
+    static uint8_t heading_valid = 0U;
+    static float target_yaw = 0.0f;
+    int16_t distance_error;
+    int16_t base_pwm;
+    int16_t heading_pwm;
+    int16_t heading_limit;
+    float heading_error;
+
+    if (car.distance_valid == 0U) {
+        heading_valid = 0U;
+        RearCar_Stop();
+        return;
+    }
+
+    distance_error = (int16_t)car.distance_cm - FOLLOW_DISTANCE_TARGET_CM;
+    if (distance_error <= FOLLOW_DISTANCE_DEADBAND_CM) {
+        heading_valid = 0U;
+        RearCar_Stop();
+        return;
+    }
+
+    if (heading_valid == 0U) {
+        target_yaw = REAR_YAW_SIGN * Yaw_GetAngle();
+        heading_valid = 1U;
+    }
+
+    base_pwm = clamp_i16((int32_t)((float)distance_error * FOLLOW_DISTANCE_KP),
+                         0,
+                         FOLLOW_DISTANCE_TEST_MAX_PWM);
+    if (base_pwm < FOLLOW_DISTANCE_TEST_MIN_PWM) {
+        base_pwm = FOLLOW_DISTANCE_TEST_MIN_PWM;
+    }
+
+    heading_limit = (int16_t)(((int32_t)base_pwm * 3) / 10);
+    heading_error = HeadingPID_Update(target_yaw,
+                                      REAR_YAW_SIGN * Yaw_GetAngle(),
+                                      (float)FOLLOW_CONTROL_MS / 1000.0f,
+                                      (float)heading_limit);
+    heading_pwm = clamp_i16((int32_t)heading_error,
+                            -heading_limit,
+                            heading_limit);
+
+    car.left_pwm = clamp_i16((int32_t)base_pwm - heading_pwm, 0, 999);
+    car.right_pwm = clamp_i16((int32_t)base_pwm + heading_pwm, 0, 999);
+    car.mode = REAR_MODE_NORMAL;
+    Motor_SetPWM(car.left_pwm, car.right_pwm);
 }
 
 static void RearCar_ControlTask(void)
@@ -259,12 +334,20 @@ static void RearCar_ControlTask(void)
     int16_t steering_pwm;
     int16_t steering_limit;
     int16_t base_abs;
-    int16_t turn_abs;
+    int16_t raw_turn_abs;
+    int16_t distance_error;
+    int16_t distance_pwm;
+    uint8_t turning_command;
     uint8_t pivot_command;
     int32_t left;
     int32_t right;
     uint32_t now = HAL_GetTick();
     const NRF24L01_Packet *delayed_packet = &car.delayed_radio;
+
+    if (FOLLOW_DISTANCE_ONLY_TEST != 0U) {
+        RearCar_DistanceTestTask();
+        return;
+    }
 
     car.radio_ok = NRF24L01_IsConnected(now);
     if (!car.radio_ok) {
@@ -288,7 +371,7 @@ static void RearCar_ControlTask(void)
 
         if ((front_motion_seen != 0U) &&
             (start_distance_count >= FOLLOW_START_CONFIRM_N)) {
-            if (TrackBuffer_StartPlayback(now) == 0U) {
+            if (TrackBuffer_StartPlayback() == 0U) {
                 RearCar_Stop();
                 car.mode = REAR_MODE_BUFFERING;
                 return;
@@ -300,43 +383,82 @@ static void RearCar_ControlTask(void)
         }
     }
 
-    (void)TrackBuffer_GetPlayback(now, &car.delayed_radio);
+    (void)TrackBuffer_GetPlayback(&car.delayed_radio);
     if (playback_active == 0U) {
         RearCar_Stop();
         car.mode = REAR_MODE_BUFFERING;
         return;
     }
 
-    /* After the 15 cm start gate, motion comes entirely from radio playback. */
+    /* After the 15 cm start gate, encoder path selects the front command. */
     base_pwm = clamp_i16(delayed_packet->speed,
                          -FOLLOW_MAX_BASE_PWM,
                          FOLLOW_MAX_BASE_PWM);
     car.mode = REAR_MODE_PREDICT;
 
-    turn_pwm = clamp_i16((int32_t)((float)delayed_packet->turn * FOLLOW_TURN_FF_GAIN),
-                         -FOLLOW_MAX_TURN_PWM,
-                         FOLLOW_MAX_TURN_PWM);
+    raw_turn_abs = (delayed_packet->turn < 0) ?
+                   (int16_t)(-(int32_t)delayed_packet->turn) :
+                   delayed_packet->turn;
+    turning_command = (raw_turn_abs >= FOLLOW_TURN_DETECT_PWM) ? 1U : 0U;
+    if (turning_command != 0U) {
+        turn_pwm = clamp_i16(delayed_packet->turn,
+                             -FOLLOW_MAX_TURN_PWM,
+                             FOLLOW_MAX_TURN_PWM);
+    } else {
+        turn_pwm = 0;
+    }
+
+    /* Use ultrasonic spacing only on straight segments with a valid echo. */
+    if ((turning_command == 0U) && (car.distance_valid != 0U)) {
+        distance_error = (int16_t)car.distance_cm - FOLLOW_DISTANCE_TARGET_CM;
+        if ((distance_error >= -FOLLOW_DISTANCE_DEADBAND_CM) &&
+            (distance_error <= FOLLOW_DISTANCE_DEADBAND_CM)) {
+            distance_error = 0;
+        }
+        distance_pwm = clamp_i16((int32_t)((float)distance_error *
+                                           FOLLOW_DISTANCE_KP),
+                                  -FOLLOW_DISTANCE_MAX_PWM,
+                                  FOLLOW_DISTANCE_MAX_PWM);
+        base_pwm = clamp_i16((int32_t)base_pwm + distance_pwm,
+                             -FOLLOW_MAX_BASE_PWM,
+                             FOLLOW_MAX_BASE_PWM);
+
+        if ((delayed_packet->speed >= 0) && (base_pwm < 0)) {
+            base_pwm = 0;
+        }
+    }
 
     front_yaw = FRONT_YAW_SIGN * ((float)delayed_packet->yaw / 10.0f);
     if (heading_reference_valid == 0U) {
         front_yaw_reference = front_yaw;
         rear_yaw_reference = REAR_YAW_SIGN * Yaw_GetAngle();
+        rear_target_yaw = rear_yaw_reference;
         heading_reference_valid = 1U;
     }
 
-    rear_target_yaw = normalize_angle_deg(rear_yaw_reference +
-        angle_error_deg(front_yaw, front_yaw_reference));
+    if (turning_command != 0U) {
+        rear_target_yaw = normalize_angle_deg(rear_yaw_reference +
+            angle_error_deg(front_yaw, front_yaw_reference));
+    }
     heading_error = angle_error_deg(rear_target_yaw,
                                     REAR_YAW_SIGN * Yaw_GetAngle());
-    heading_pwm = heading_error * FOLLOW_HEADING_KP;
-    heading_pwm = (float)clamp_i16((int32_t)heading_pwm,
-                                   -FOLLOW_MAX_HEADING_PWM,
-                                   FOLLOW_MAX_HEADING_PWM);
+
+    /* Stop the turn command after reaching this path point's target yaw. */
+    if (turning_command != 0U) {
+        if (((turn_pwm > 0) && (heading_error <= 0.0f)) ||
+            ((turn_pwm < 0) && (heading_error >= 0.0f))) {
+            turn_pwm = 0;
+        }
+    }
+
+    heading_pwm = HeadingPID_Update(rear_target_yaw,
+                                    REAR_YAW_SIGN * Yaw_GetAngle(),
+                                    (float)FOLLOW_CONTROL_MS / 1000.0f,
+                                    (float)FOLLOW_MAX_HEADING_PWM);
 
     base_abs = (base_pwm < 0) ? (int16_t)-base_pwm : base_pwm;
-    turn_abs = (turn_pwm < 0) ? (int16_t)-turn_pwm : turn_pwm;
     pivot_command = ((base_abs < FOLLOW_MIN_DRIVE_PWM) &&
-                     (turn_abs >= FOLLOW_PIVOT_TURN_PWM)) ? 1U : 0U;
+                     (raw_turn_abs >= FOLLOW_PIVOT_TURN_PWM)) ? 1U : 0U;
 
     /* A stopped front car must not trigger gyro-only rotation. */
     if ((base_abs < FOLLOW_MIN_DRIVE_PWM) && (pivot_command == 0U)) {
@@ -364,6 +486,12 @@ static void RearCar_ControlTask(void)
 
 static void RearCar_UpdateOLED(void)
 {
+    uint32_t distance_mm = (uint32_t)((((uint64_t)rear_odometer_ticks * 141372U) +
+                                       265317U) / 530634U);
+    int32_t yaw_x10 = (int32_t)(Yaw_GetAngle() * 10.0f);
+    uint32_t yaw_abs_x10 = (yaw_x10 < 0) ?
+                           (uint32_t)(-yaw_x10) : (uint32_t)yaw_x10;
+
     OLED_Clear();
     OLED_ShowString(1, 1, "D:");
     if (car.distance_valid) {
@@ -395,19 +523,13 @@ static void RearCar_UpdateOLED(void)
         OLED_ShowNum(3, 11, car.delayed_radio.seq, 3);
     }
 
-    if (car.radio_ok) {
-        OLED_ShowString(4, 1, "FY:");
-        OLED_ShowSignedNum(4, 4, (int32_t)(car.delayed_radio.yaw / 10), 4);
-        OLED_ShowString(4, 10, "C:");
-        OLED_ShowNum(4, 12, car.delayed_radio.checksum, 3);
-    } else {
-        OLED_ShowString(4, 1, "CH:");
-        OLED_ShowHexNum(4, 4, NRF24L01_ReadRegister(0x05U), 2);
-        OLED_ShowString(4, 7, "CF:");
-        OLED_ShowHexNum(4, 10, NRF24L01_ReadRegister(0x00U), 2);
-        OLED_ShowString(4, 13, "F:");
-        OLED_ShowHexNum(4, 15, NRF24L01_ReadRegister(0x17U), 2);
-    }
+    OLED_ShowString(4, 1, "D");
+    OLED_ShowNum(4, 2, (distance_mm + 5U) / 10U, 4);
+    OLED_ShowString(4, 6, "Y");
+    OLED_ShowString(4, 7, (yaw_x10 < 0) ? "-" : "+");
+    OLED_ShowNum(4, 8, yaw_abs_x10 / 10U, 3);
+    OLED_ShowString(4, 11, ".");
+    OLED_ShowNum(4, 12, yaw_abs_x10 % 10U, 1);
 }
 /* USER CODE END 0 */
 
@@ -456,6 +578,7 @@ int main(void)
     static uint32_t last_distance_tick = 0;
     static uint32_t last_control_tick = 0;
     static uint32_t last_oled_tick = 0;
+    static uint16_t filtered_distance_cm = 0U;
     uint32_t now = HAL_GetTick();
     NRF24L01_Packet packet;
     NRF24L01_Status radio_status;
@@ -471,18 +594,27 @@ int main(void)
                 (turn_abs >= FOLLOW_PIVOT_TURN_PWM)) {
                 TrackBuffer_Reset();
                 front_motion_seen = 1U;
-                TrackBuffer_Push(&packet, now);
+                TrackBuffer_Push(&packet);
             }
         } else {
-            TrackBuffer_Push(&packet, now);
+            TrackBuffer_Push(&packet);
         }
     }
 
     if ((uint32_t)(now - last_distance_tick) >= FOLLOW_DISTANCE_MS) {
         uint16_t distance = HCSR04_ReadDistanceCm();
+        uint8_t distance_valid = RearCar_IsDistanceValid(distance);
         last_distance_tick = now;
-        car.distance_cm = distance;
-        car.distance_valid = RearCar_IsDistanceValid(distance);
+        car.distance_valid = distance_valid;
+        if (distance_valid != 0U) {
+            if (filtered_distance_cm == 0U) {
+                filtered_distance_cm = distance;
+            } else {
+                filtered_distance_cm = (uint16_t)(((uint32_t)filtered_distance_cm * 3U +
+                                                    distance + 2U) / 4U);
+            }
+            car.distance_cm = filtered_distance_cm;
+        }
     }
 
     if ((uint32_t)(now - last_control_tick) >= FOLLOW_CONTROL_MS) {
@@ -789,8 +921,28 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     }
 
     Get_Motor_Speed(&speed_l, &speed_r);
+    /* Right encoder is mounted with opposite polarity to the left encoder. */
+    speed_r = (int16_t)(-(int32_t)speed_r);
     last_speedL = speed_l;
     last_speedR = speed_r;
+    {
+        uint16_t left_ticks = (speed_l < 0) ?
+                              (uint16_t)(-(int32_t)speed_l) :
+                              (uint16_t)speed_l;
+        uint16_t right_ticks = (speed_r < 0) ?
+                               (uint16_t)(-(int32_t)speed_r) :
+                               (uint16_t)speed_r;
+        uint32_t tick_sum = (uint32_t)left_ticks + right_ticks;
+        uint32_t odometer_sum = tick_sum + rear_odometer_half_tick;
+
+        rear_odometer_ticks += odometer_sum / 2U;
+        rear_odometer_half_tick = (uint8_t)(odometer_sum & 1U);
+        if (playback_active != 0U) {
+            uint32_t path_sum = tick_sum + rear_path_half_tick;
+            rear_path_ticks += path_sum / 2U;
+            rear_path_half_tick = (uint8_t)(path_sum & 1U);
+        }
+    }
     Yaw_Update();
 }
 /* USER CODE END 4 */

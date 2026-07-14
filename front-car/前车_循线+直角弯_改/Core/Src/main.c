@@ -69,6 +69,8 @@ volatile int16_t g_left = 0;
 volatile int16_t g_right = 0;
 volatile int16_t g_motor_cmd_left = 0;
 volatile int16_t g_motor_cmd_right = 0;
+volatile uint32_t g_path_ticks = 0U;
+volatile uint8_t g_path_half_tick = 0U;
 volatile uint8_t g_nrf_ready = 0;
 volatile uint8_t g_nrf_tx_ok = 0;
 volatile uint8_t g_turning = 0;
@@ -190,10 +192,21 @@ int main(void)
     // OLED 显示 8 路 + 总和（调试用）
     {
         char t[18];
+        uint32_t distance_mm = (uint32_t)((((uint64_t)g_path_ticks * 141372U) +
+                                           265317U) / 530634U);
+        int32_t yaw_x10 = (int32_t)(Yaw_GetAngle() * 10.0f);
+        uint32_t yaw_abs_x10 = (yaw_x10 < 0) ?
+                               (uint32_t)(-yaw_x10) : (uint32_t)yaw_x10;
         sprintf(t, "L%4d%4d%4d%4d", adc_values[0], adc_values[1], adc_values[2], adc_values[3]);
         OLED_ShowString(3, 1, t);
-        sprintf(t, "R%4d%4d%4d%4d", adc_values[4], adc_values[5], adc_values[6], adc_values[7]);
-        OLED_ShowString(4, 1, t);
+        OLED_ShowString(4, 1, "                ");
+        OLED_ShowString(4, 1, "D");
+        OLED_ShowNum(4, 2, (distance_mm + 5U) / 10U, 4);
+        OLED_ShowString(4, 6, "Y");
+        OLED_ShowString(4, 7, (yaw_x10 < 0) ? "-" : "+");
+        OLED_ShowNum(4, 8, yaw_abs_x10 / 10U, 3);
+        OLED_ShowString(4, 11, ".");
+        OLED_ShowNum(4, 12, yaw_abs_x10 % 10U, 1);
     }
     {
         static uint32_t last_nrf_retry = 0U;
@@ -214,7 +227,8 @@ int main(void)
             if ((uint32_t)(now - last_nrf_send) >= 20U)
             {
                 last_nrf_send = now;
-                g_nrf_tx_ok = (NRF24L01_SendCarData(speed, turn, yaw_x10) == NRF24L01_TX_OK);
+                g_nrf_tx_ok = (NRF24L01_SendCarData(speed, turn, yaw_x10,
+                                                    g_path_ticks) == NRF24L01_TX_OK);
             }
             OLED_ShowString(2, 1, g_nrf_tx_ok ? "RF:OK Q:   " : "RF:ERR Q:  ");
             OLED_ShowNum(2, 9, NRF24L01_LastSequence(), 3);
@@ -685,6 +699,19 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         ADC_ReadAll();
         last_speedL = Get_Encoder_Speed(&htim3);
         last_speedR = Get_Encoder_Speed(&htim4);
+        last_speedR = (int16_t)(-(int32_t)last_speedR);
+        {
+            uint16_t left_ticks = (last_speedL < 0) ?
+                                  (uint16_t)(-(int32_t)last_speedL) :
+                                  (uint16_t)last_speedL;
+            uint16_t right_ticks = (last_speedR < 0) ?
+                                   (uint16_t)(-(int32_t)last_speedR) :
+                                   (uint16_t)last_speedR;
+            uint32_t tick_sum = (uint32_t)left_ticks + right_ticks +
+                                g_path_half_tick;
+            g_path_ticks += tick_sum / 2U;
+            g_path_half_tick = (uint8_t)(tick_sum & 1U);
+        }
         Yaw_Update();
 
         if (step == 1)

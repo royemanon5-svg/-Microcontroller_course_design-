@@ -128,12 +128,12 @@ static NRF24L01_Status send_command(uint8_t cmd)
     return ret;
 }
 
-static uint8_t checksum7(const uint8_t *data)
+static uint8_t packet_checksum(const uint8_t *data)
 {
     uint8_t sum = 0;
     uint8_t i;
 
-    for (i = 0; i < 7U; i++) {
+    for (i = 0; i < (NRF24L01_PAYLOAD_SIZE - 1U); i++) {
         sum = (uint8_t)(sum + data[i]);
     }
 
@@ -217,22 +217,32 @@ NRF24L01_Status NRF24L01_ReadPacket(NRF24L01_Packet *packet)
     }
 
     /* A failed/floating SPI read often returns a complete all-zero payload. */
-    if ((payload[0] == 0U) && (payload[1] == 0U) &&
-        (payload[2] == 0U) && (payload[3] == 0U) &&
-        (payload[4] == 0U) && (payload[5] == 0U) &&
-        (payload[6] == 0U) && (payload[7] == 0U)) {
-        return NRF24L01_SPI_ERROR;
+    {
+        uint8_t all_zero = 1U;
+        for (i = 0U; i < NRF24L01_PAYLOAD_SIZE; i++) {
+            if (payload[i] != 0U) {
+                all_zero = 0U;
+                break;
+            }
+        }
+        if (all_zero != 0U) {
+            return NRF24L01_SPI_ERROR;
+        }
     }
 
-    if (checksum7(payload) != payload[7]) {
+    if (packet_checksum(payload) != payload[11]) {
         return NRF24L01_CHECKSUM_ERROR;
     }
 
     packet->speed = (int16_t)((uint16_t)payload[0] | ((uint16_t)payload[1] << 8));
     packet->turn = (int16_t)((uint16_t)payload[2] | ((uint16_t)payload[3] << 8));
     packet->yaw = (int16_t)((uint16_t)payload[4] | ((uint16_t)payload[5] << 8));
-    packet->seq = payload[6];
-    packet->checksum = payload[7];
+    packet->path_ticks = (uint32_t)payload[6] |
+                         ((uint32_t)payload[7] << 8) |
+                         ((uint32_t)payload[8] << 16) |
+                         ((uint32_t)payload[9] << 24);
+    packet->seq = payload[10];
+    packet->checksum = payload[11];
 
     /* A packet already read from the FIFO must not keep the link alive. */
     if ((sequence_valid != 0U) && (packet->seq == last_sequence)) {
