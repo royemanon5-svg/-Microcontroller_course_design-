@@ -86,6 +86,7 @@ typedef struct {
 /* Calibrate odometry here instead of changing the rear-car PWM. */
 #define REAR_PATH_SCALE_NUM     1000U
 #define REAR_PATH_SCALE_DEN     1000U
+#define FOLLOW_PLAYBACK_DELAY_MM 20U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -336,6 +337,7 @@ static uint8_t TrackBuffer_GetPlayback(NRF24L01_Packet *packet)
 {
     uint64_t rear_um;
     uint64_t scaled_rear_um;
+    uint64_t playback_delay_um;
     uint64_t target_front_um;
 
     if ((playback_active == 0U) || (packet == 0)) {
@@ -348,7 +350,11 @@ static uint8_t TrackBuffer_GetPlayback(NRF24L01_Packet *packet)
     scaled_rear_um = ((rear_um * REAR_PATH_SCALE_NUM) +
                       (REAR_PATH_SCALE_DEN / 2U)) /
                      REAR_PATH_SCALE_DEN;
-    target_front_um = front_path_origin_um + scaled_rear_um;
+    playback_delay_um = (uint64_t)FOLLOW_PLAYBACK_DELAY_MM * 1000U;
+    target_front_um = front_path_origin_um;
+    if (scaled_rear_um > playback_delay_um) {
+        target_front_um += scaled_rear_um - playback_delay_um;
+    }
     playback_target_front_um = target_front_um;
 
     /* Execute each front command when the rear car reaches the same wheel path. */
