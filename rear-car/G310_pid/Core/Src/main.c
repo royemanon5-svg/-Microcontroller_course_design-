@@ -65,6 +65,7 @@ typedef struct {
 #define FOLLOW_MIN_DRIVE_PWM    20
 #define FOLLOW_TURN_DETECT_PWM  40
 #define FOLLOW_PIVOT_TURN_PWM   60
+#define FOLLOW_APPROACH_TURN_MAX_PWM 120
 #define FOLLOW_PREVIEW_DISTANCE_MM 5U
 #define FOLLOW_EFFECTIVE_TRACK_MM 110.0f
 #define FOLLOW_CURVATURE_BLEND_PERCENT 10
@@ -86,7 +87,7 @@ typedef struct {
 /* Calibrate odometry here instead of changing the rear-car PWM. */
 #define REAR_PATH_SCALE_NUM     1000U
 #define REAR_PATH_SCALE_DEN     1000U
-#define FOLLOW_PLAYBACK_DELAY_MM 158U
+#define FOLLOW_PLAYBACK_DELAY_MM 150U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -131,6 +132,7 @@ static float rear_target_yaw = 0.0f;
 static float front_yaw_reference = 0.0f;
 static float rear_yaw_reference = 0.0f;
 static uint8_t heading_reference_valid = 0U;
+static uint8_t approach_turn_active = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -292,6 +294,7 @@ static void TrackBuffer_Reset(void)
     distance_trim_pwm = 0;
     last_turn_feedforward_pwm = 0;
     playback_target_front_um = 0U;
+    approach_turn_active = 0U;
 }
 
 static void TrackBuffer_Push(const NRF24L01_Packet *packet)
@@ -532,6 +535,7 @@ static void RearCar_ControlTask(void)
     int16_t steering_limit;
     int16_t base_abs;
     int16_t raw_turn_abs;
+    int16_t live_turn_abs;
     int16_t preview_yaw_x10;
     uint8_t preview_valid;
     uint8_t turning_command;
@@ -603,10 +607,18 @@ static void RearCar_ControlTask(void)
                              FOLLOW_MAX_TURN_PWM);
     raw_turn_abs = (raw_turn_pwm < 0) ?
                    (int16_t)(-(int32_t)raw_turn_pwm) : raw_turn_pwm;
+    live_turn_abs = (car.radio.turn < 0) ?
+                    (int16_t)(-(int32_t)car.radio.turn) : car.radio.turn;
     turning_command = ((raw_turn_abs >= FOLLOW_TURN_DETECT_PWM) ||
                        ((preview_valid != 0U) &&
                         (fabsf(preview_yaw_delta) >=
                          FOLLOW_CURVATURE_MIN_YAW_DEG))) ? 1U : 0U;
+
+    if (turning_command != 0U) {
+        approach_turn_active = 0U;
+    } else if (live_turn_abs >= FOLLOW_TURN_DETECT_PWM) {
+        approach_turn_active = 1U;
+    }
 
     if (heading_reference_valid == 0U) {
         front_yaw_reference = front_yaw;
@@ -707,6 +719,11 @@ static void RearCar_ControlTask(void)
                          FOLLOW_MAX_BASE_PWM);
     if ((delayed_packet->speed >= 0) && (base_pwm < 0)) {
         base_pwm = 0;
+    }
+    if (approach_turn_active != 0U) {
+        base_pwm = clamp_i16(base_pwm,
+                             -FOLLOW_APPROACH_TURN_MAX_PWM,
+                             FOLLOW_APPROACH_TURN_MAX_PWM);
     }
 
     heading_pwm = HeadingPID_Update(rear_target_yaw,
