@@ -1,6 +1,7 @@
 #include "hcsr04.h"
 
-#define HCSR04_TIMEOUT_US 30000U
+/* 80 cm needs about 4.7 ms round-trip time; 6 ms leaves enough margin. */
+#define HCSR04_TIMEOUT_US 6000U
 
 static HCSR04_Status last_status = HCSR04_STATUS_NO_ECHO;
 

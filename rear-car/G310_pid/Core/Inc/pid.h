@@ -13,7 +13,7 @@
 #define angle_Kp 2.0f  //2.0
 #define angle_Ki 0.0f //0.00
 #define angle_Kd 2.5f //2.5
-// 跟车航向 PID（20 ms 控制周期）
+// 跟车航向 PID（实际控制周期由调用参数传入）
 #define HEADING_PID_KP              2.2f
 #define HEADING_PID_KI              0.08f
 #define HEADING_PID_KD              0.12f

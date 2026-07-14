@@ -67,7 +67,7 @@ typedef struct {
 #define FOLLOW_PIVOT_TURN_PWM   60
 #define FRONT_YAW_SIGN          1.0f
 #define REAR_YAW_SIGN           1.0f
-#define FOLLOW_CONTROL_MS       20U
+#define FOLLOW_CONTROL_MS       10U
 #define FOLLOW_DISTANCE_MS      50U
 #define FOLLOW_OLED_MS          200U
 #define TRACK_BUFFER_SIZE       256U
@@ -104,6 +104,8 @@ static TrackPoint track_buffer[TRACK_BUFFER_SIZE];
 static uint16_t track_head = 0U;
 static uint16_t track_tail = 0U;
 static uint16_t track_count = 0U;
+static NRF24L01_Packet playback_anchor = {0};
+static uint8_t playback_anchor_valid = 0U;
 static uint8_t front_motion_seen = 0U;
 static volatile uint8_t playback_active = 0U;
 static uint8_t start_distance_count = 0U;
@@ -111,7 +113,7 @@ static volatile uint32_t rear_path_ticks = 0U;
 static volatile uint32_t rear_odometer_ticks = 0U;
 static volatile uint8_t rear_path_half_tick = 0U;
 static volatile uint8_t rear_odometer_half_tick = 0U;
-static uint32_t front_path_origin_mm = 0U;
+static uint64_t front_path_origin_um = 0U;
 static uint32_t front_start_path_mm = 0U;
 static uint16_t spacing_reference_mm = 200U;
 static uint8_t distance_stable_count = 0U;
@@ -135,6 +137,12 @@ static void MX_SPI2_Init(void);
 static int16_t clamp_i16(int32_t value, int16_t min_value, int16_t max_value);
 static uint32_t ticks_to_mm(uint32_t ticks, uint32_t numerator,
                             uint32_t denominator);
+static uint64_t ticks_to_um(uint32_t ticks, uint32_t numerator,
+                            uint32_t denominator);
+static int16_t interpolate_i16(int16_t start, int16_t end,
+                               uint64_t numerator, uint64_t denominator);
+static int16_t interpolate_yaw_x10(int16_t start, int16_t end,
+                                   uint64_t numerator, uint64_t denominator);
 static float angle_error_deg(float target, float current);
 static float normalize_angle_deg(float angle);
 static uint8_t RearCar_IsDistanceValid(uint16_t distance_cm);
@@ -142,6 +150,7 @@ static void TrackBuffer_Reset(void);
 static void TrackBuffer_Push(const NRF24L01_Packet *packet);
 static uint8_t TrackBuffer_StartPlayback(void);
 static uint8_t TrackBuffer_GetPlayback(NRF24L01_Packet *packet);
+static void RearCar_RecordPacket(const NRF24L01_Packet *packet);
 static int32_t RearCar_EstimatedGapMm(void);
 static uint8_t RearCar_CanUseUltrasonic(uint8_t turning_command,
                                         float heading_error);
@@ -168,6 +177,58 @@ static uint32_t ticks_to_mm(uint32_t ticks, uint32_t numerator,
 {
     return (uint32_t)((((uint64_t)ticks * numerator) +
                        (denominator / 2U)) / denominator);
+}
+
+static uint64_t ticks_to_um(uint32_t ticks, uint32_t numerator,
+                            uint32_t denominator)
+{
+    return (((uint64_t)ticks * numerator * 1000U) +
+            (denominator / 2U)) / denominator;
+}
+
+static int16_t interpolate_i16(int16_t start, int16_t end,
+                               uint64_t numerator, uint64_t denominator)
+{
+    int64_t delta;
+    int64_t value;
+
+    if ((denominator == 0U) || (numerator >= denominator)) {
+        return end;
+    }
+
+    delta = (int64_t)end - start;
+    value = (int64_t)start + (delta * (int64_t)numerator) /
+                              (int64_t)denominator;
+    return (int16_t)value;
+}
+
+static int16_t interpolate_yaw_x10(int16_t start, int16_t end,
+                                   uint64_t numerator, uint64_t denominator)
+{
+    int32_t delta = (int32_t)end - start;
+    int32_t value;
+
+    while (delta > 1800) {
+        delta -= 3600;
+    }
+    while (delta < -1800) {
+        delta += 3600;
+    }
+    if ((denominator == 0U) || (numerator >= denominator)) {
+        value = (int32_t)start + delta;
+    } else {
+        value = (int32_t)start +
+                (int32_t)(((int64_t)delta * (int64_t)numerator) /
+                          (int64_t)denominator);
+    }
+
+    while (value > 1800) {
+        value -= 3600;
+    }
+    while (value < -1800) {
+        value += 3600;
+    }
+    return (int16_t)value;
 }
 
 static float angle_error_deg(float target, float current)
@@ -216,6 +277,7 @@ static void TrackBuffer_Reset(void)
     track_head = 0U;
     track_tail = 0U;
     track_count = 0U;
+    playback_anchor_valid = 0U;
     playback_active = 0U;
     rear_path_ticks = 0U;
     rear_path_half_tick = 0U;
@@ -241,7 +303,7 @@ static uint8_t TrackBuffer_StartPlayback(void)
         return 0U;
     }
 
-    front_path_origin_mm = ticks_to_mm(track_buffer[track_tail].packet.path_ticks,
+    front_path_origin_um = ticks_to_um(track_buffer[track_tail].packet.path_ticks,
                                       FRONT_TICKS_TO_MM_NUM,
                                       FRONT_TICKS_TO_MM_DEN);
     front_start_path_mm = ticks_to_mm(car.radio.path_ticks,
@@ -252,48 +314,98 @@ static uint8_t TrackBuffer_StartPlayback(void)
                            (uint16_t)(FOLLOW_DISTANCE_TARGET_CM * 10U);
     rear_path_ticks = 0U;
     rear_path_half_tick = 0U;
+    playback_anchor_valid = 0U;
     playback_active = 1U;
     return 1U;
 }
 
 static uint8_t TrackBuffer_GetPlayback(NRF24L01_Packet *packet)
 {
-    uint32_t rear_mm;
-    uint32_t scaled_rear_mm;
-    uint32_t target_front_mm;
-    uint8_t updated = 0U;
+    uint64_t rear_um;
+    uint64_t scaled_rear_um;
+    uint64_t target_front_um;
 
     if ((playback_active == 0U) || (packet == 0)) {
         return 0U;
     }
 
-    rear_mm = ticks_to_mm(rear_path_ticks,
+    rear_um = ticks_to_um(rear_path_ticks,
                          REAR_TICKS_TO_MM_NUM,
                          REAR_TICKS_TO_MM_DEN);
-    scaled_rear_mm = (uint32_t)((((uint64_t)rear_mm * REAR_PATH_SCALE_NUM) +
-                                 (REAR_PATH_SCALE_DEN / 2U)) /
-                                REAR_PATH_SCALE_DEN);
-    target_front_mm = front_path_origin_mm + scaled_rear_mm;
+    scaled_rear_um = ((rear_um * REAR_PATH_SCALE_NUM) +
+                      (REAR_PATH_SCALE_DEN / 2U)) /
+                     REAR_PATH_SCALE_DEN;
+    target_front_um = front_path_origin_um + scaled_rear_um;
 
     /* Execute each front command when the rear car reaches the same wheel path. */
     while (track_count > 0U) {
         TrackPoint *point = &track_buffer[track_tail];
 
-        uint32_t point_mm = ticks_to_mm(point->packet.path_ticks,
+        uint64_t point_um = ticks_to_um(point->packet.path_ticks,
                                        FRONT_TICKS_TO_MM_NUM,
                                        FRONT_TICKS_TO_MM_DEN);
 
-        if ((int32_t)(target_front_mm - point_mm) < 0) {
+        if (point_um > target_front_um) {
             break;
         }
 
-        *packet = point->packet;
+        playback_anchor = point->packet;
+        playback_anchor_valid = 1U;
         track_tail = (uint16_t)((track_tail + 1U) % TRACK_BUFFER_SIZE);
         track_count--;
-        updated = 1U;
     }
 
-    return updated;
+    if (playback_anchor_valid == 0U) {
+        return 0U;
+    }
+
+    *packet = playback_anchor;
+    if (track_count > 0U) {
+        const NRF24L01_Packet *next = &track_buffer[track_tail].packet;
+        uint64_t anchor_um = ticks_to_um(playback_anchor.path_ticks,
+                                         FRONT_TICKS_TO_MM_NUM,
+                                         FRONT_TICKS_TO_MM_DEN);
+        uint64_t next_um = ticks_to_um(next->path_ticks,
+                                       FRONT_TICKS_TO_MM_NUM,
+                                       FRONT_TICKS_TO_MM_DEN);
+
+        if ((next_um > anchor_um) && (target_front_um > anchor_um)) {
+            uint64_t position = target_front_um - anchor_um;
+            uint64_t span = next_um - anchor_um;
+
+            if (position > span) {
+                position = span;
+            }
+            packet->speed = interpolate_i16(playback_anchor.speed, next->speed,
+                                            position, span);
+            packet->turn = interpolate_i16(playback_anchor.turn, next->turn,
+                                           position, span);
+            packet->yaw = interpolate_yaw_x10(playback_anchor.yaw, next->yaw,
+                                              position, span);
+        }
+    }
+
+    return 1U;
+}
+
+static void RearCar_RecordPacket(const NRF24L01_Packet *packet)
+{
+    int16_t speed_abs = (packet->speed < 0) ?
+                        (int16_t)(-(int32_t)packet->speed) : packet->speed;
+    int16_t turn_abs = (packet->turn < 0) ?
+                       (int16_t)(-(int32_t)packet->turn) : packet->turn;
+
+    car.radio = *packet;
+    if (front_motion_seen == 0U) {
+        if ((speed_abs >= FOLLOW_MIN_DRIVE_PWM) ||
+            (turn_abs >= FOLLOW_PIVOT_TURN_PWM)) {
+            TrackBuffer_Reset();
+            front_motion_seen = 1U;
+            TrackBuffer_Push(packet);
+        }
+    } else {
+        TrackBuffer_Push(packet);
+    }
 }
 
 static int32_t RearCar_EstimatedGapMm(void)
@@ -610,58 +722,66 @@ int main(void)
     NRF24L01_Packet packet;
     NRF24L01_Status radio_status;
 
-    radio_status = NRF24L01_ReadPacket(&packet);
-    if (radio_status == NRF24L01_OK) {
-        int16_t speed_abs = (packet.speed < 0) ? (int16_t)-packet.speed : packet.speed;
-        int16_t turn_abs = (packet.turn < 0) ? (int16_t)-packet.turn : packet.turn;
-
-        car.radio = packet;
-        if (front_motion_seen == 0U) {
-            if ((speed_abs >= FOLLOW_MIN_DRIVE_PWM) ||
-                (turn_abs >= FOLLOW_PIVOT_TURN_PWM)) {
-                TrackBuffer_Reset();
-                front_motion_seen = 1U;
-                TrackBuffer_Push(&packet);
-            }
-        } else {
-            TrackBuffer_Push(&packet);
+    /* Drain the three-entry NRF RX FIFO before running slower peripheral tasks. */
+    for (uint8_t read_count = 0U; read_count < 3U; read_count++) {
+        radio_status = NRF24L01_ReadPacket(&packet);
+        if (radio_status == NRF24L01_OK) {
+            RearCar_RecordPacket(&packet);
+        } else if ((radio_status == NRF24L01_NO_DATA) ||
+                   (radio_status == NRF24L01_SPI_ERROR)) {
+            break;
         }
     }
 
+    /* Keep the motor control ahead of the blocking ultrasonic measurement. */
+    if ((uint32_t)(now - last_control_tick) >= FOLLOW_CONTROL_MS) {
+        last_control_tick = now;
+        RearCar_ControlTask();
+    }
+
     if ((uint32_t)(now - last_distance_tick) >= FOLLOW_DISTANCE_MS) {
-        uint16_t distance = HCSR04_ReadDistanceCm();
-        uint8_t distance_valid = RearCar_IsDistanceValid(distance);
+        int16_t turn_abs = (car.delayed_radio.turn < 0) ?
+                           (int16_t)(-(int32_t)car.delayed_radio.turn) :
+                           car.delayed_radio.turn;
+        uint8_t turning = ((playback_active != 0U) &&
+                           (turn_abs >= FOLLOW_TURN_DETECT_PWM)) ? 1U : 0U;
+
         last_distance_tick = now;
-        if (distance_valid == 0U) {
+        if (turning != 0U) {
             car.distance_valid = 0U;
             distance_stable_count = 0U;
             last_raw_distance_cm = 0U;
             filtered_distance_cm = 0U;
         } else {
-            uint16_t jump_cm = (distance >= last_raw_distance_cm) ?
-                               (uint16_t)(distance - last_raw_distance_cm) :
-                               (uint16_t)(last_raw_distance_cm - distance);
+            uint16_t distance = HCSR04_ReadDistanceCm();
+            uint8_t distance_valid = RearCar_IsDistanceValid(distance);
 
-            if ((last_raw_distance_cm == 0U) ||
-                (jump_cm > FOLLOW_DISTANCE_MAX_JUMP_CM)) {
-                distance_stable_count = 1U;
-                filtered_distance_cm = distance;
+            if (distance_valid == 0U) {
+                car.distance_valid = 0U;
+                distance_stable_count = 0U;
+                last_raw_distance_cm = 0U;
+                filtered_distance_cm = 0U;
             } else {
-                if (distance_stable_count < FOLLOW_DISTANCE_STABLE_N) {
-                    distance_stable_count++;
-                }
-                filtered_distance_cm = (uint16_t)(((uint32_t)filtered_distance_cm * 3U +
-                                                    distance + 2U) / 4U);
-            }
-            last_raw_distance_cm = distance;
-            car.distance_valid = 1U;
-            car.distance_cm = filtered_distance_cm;
-        }
-    }
+                uint16_t jump_cm = (distance >= last_raw_distance_cm) ?
+                                   (uint16_t)(distance - last_raw_distance_cm) :
+                                   (uint16_t)(last_raw_distance_cm - distance);
 
-    if ((uint32_t)(now - last_control_tick) >= FOLLOW_CONTROL_MS) {
-        last_control_tick = now;
-        RearCar_ControlTask();
+                if ((last_raw_distance_cm == 0U) ||
+                    (jump_cm > FOLLOW_DISTANCE_MAX_JUMP_CM)) {
+                    distance_stable_count = 1U;
+                    filtered_distance_cm = distance;
+                } else {
+                    if (distance_stable_count < FOLLOW_DISTANCE_STABLE_N) {
+                        distance_stable_count++;
+                    }
+                    filtered_distance_cm = (uint16_t)(
+                        ((uint32_t)filtered_distance_cm * 3U + distance + 2U) / 4U);
+                }
+                last_raw_distance_cm = distance;
+                car.distance_valid = 1U;
+                car.distance_cm = filtered_distance_cm;
+            }
+        }
     }
 
     if ((uint32_t)(now - last_oled_tick) >= FOLLOW_OLED_MS) {
