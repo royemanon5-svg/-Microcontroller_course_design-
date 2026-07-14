@@ -65,6 +65,11 @@ typedef struct {
 #define FOLLOW_MIN_DRIVE_PWM    20
 #define FOLLOW_TURN_DETECT_PWM  40
 #define FOLLOW_PIVOT_TURN_PWM   60
+#define FOLLOW_PREVIEW_DISTANCE_MM 15U
+#define FOLLOW_EFFECTIVE_TRACK_MM 110.0f
+#define FOLLOW_CURVATURE_BLEND_PERCENT 60
+#define FOLLOW_CURVATURE_MIN_YAW_DEG 0.5f
+#define FOLLOW_TURN_SLEW_PWM    25
 #define FRONT_YAW_SIGN          1.0f
 #define REAR_YAW_SIGN           1.0f
 #define FOLLOW_CONTROL_MS       10U
@@ -119,6 +124,8 @@ static uint16_t spacing_reference_mm = 200U;
 static uint8_t distance_stable_count = 0U;
 static uint16_t last_raw_distance_cm = 0U;
 static int16_t distance_trim_pwm = 0;
+static int16_t last_turn_feedforward_pwm = 0;
+static uint64_t playback_target_front_um = 0U;
 static float rear_target_yaw = 0.0f;
 static float front_yaw_reference = 0.0f;
 static float rear_yaw_reference = 0.0f;
@@ -150,6 +157,8 @@ static void TrackBuffer_Reset(void);
 static void TrackBuffer_Push(const NRF24L01_Packet *packet);
 static uint8_t TrackBuffer_StartPlayback(void);
 static uint8_t TrackBuffer_GetPlayback(NRF24L01_Packet *packet);
+static uint8_t TrackBuffer_GetYawAt(uint64_t target_front_um,
+                                    int16_t *yaw_x10);
 static void RearCar_RecordPacket(const NRF24L01_Packet *packet);
 static int32_t RearCar_EstimatedGapMm(void);
 static uint8_t RearCar_CanUseUltrasonic(uint8_t turning_command,
@@ -282,6 +291,8 @@ static void TrackBuffer_Reset(void)
     rear_path_ticks = 0U;
     rear_path_half_tick = 0U;
     distance_trim_pwm = 0;
+    last_turn_feedforward_pwm = 0;
+    playback_target_front_um = 0U;
 }
 
 static void TrackBuffer_Push(const NRF24L01_Packet *packet)
@@ -336,6 +347,7 @@ static uint8_t TrackBuffer_GetPlayback(NRF24L01_Packet *packet)
                       (REAR_PATH_SCALE_DEN / 2U)) /
                      REAR_PATH_SCALE_DEN;
     target_front_um = front_path_origin_um + scaled_rear_um;
+    playback_target_front_um = target_front_um;
 
     /* Execute each front command when the rear car reaches the same wheel path. */
     while (track_count > 0U) {
@@ -385,6 +397,53 @@ static uint8_t TrackBuffer_GetPlayback(NRF24L01_Packet *packet)
         }
     }
 
+    return 1U;
+}
+
+static uint8_t TrackBuffer_GetYawAt(uint64_t target_front_um,
+                                    int16_t *yaw_x10)
+{
+    NRF24L01_Packet lower;
+    uint64_t lower_um;
+    uint16_t index;
+    uint16_t remaining;
+
+    if ((yaw_x10 == 0) || (playback_anchor_valid == 0U)) {
+        return 0U;
+    }
+
+    lower = playback_anchor;
+    lower_um = ticks_to_um(lower.path_ticks,
+                           FRONT_TICKS_TO_MM_NUM,
+                           FRONT_TICKS_TO_MM_DEN);
+    index = track_tail;
+    remaining = track_count;
+
+    while (remaining > 0U) {
+        const NRF24L01_Packet *upper = &track_buffer[index].packet;
+        uint64_t upper_um = ticks_to_um(upper->path_ticks,
+                                        FRONT_TICKS_TO_MM_NUM,
+                                        FRONT_TICKS_TO_MM_DEN);
+
+        if (upper_um > target_front_um) {
+            if ((upper_um > lower_um) && (target_front_um > lower_um)) {
+                *yaw_x10 = interpolate_yaw_x10(
+                    lower.yaw, upper->yaw,
+                    target_front_um - lower_um,
+                    upper_um - lower_um);
+            } else {
+                *yaw_x10 = lower.yaw;
+            }
+            return 1U;
+        }
+
+        lower = *upper;
+        lower_um = upper_um;
+        index = (uint16_t)((index + 1U) % TRACK_BUFFER_SIZE);
+        remaining--;
+    }
+
+    *yaw_x10 = lower.yaw;
     return 1U;
 }
 
@@ -478,19 +537,30 @@ static void RearCar_Stop(void)
     car.mode = REAR_MODE_STOP;
     Motor_SetPWM(0, 0);
     HeadingPID_Reset();
+    last_turn_feedforward_pwm = 0;
 }
 
 static void RearCar_ControlTask(void)
 {
     float front_yaw;
+    float preview_front_yaw;
+    float preview_yaw_delta;
+    float curvature_turn;
     float heading_error;
     float heading_pwm;
     int16_t base_pwm;
+    int16_t path_base_abs;
+    int16_t raw_turn_pwm;
+    int16_t curvature_turn_pwm;
+    int16_t target_turn_pwm;
     int16_t turn_pwm;
+    int16_t turn_slew_delta;
     int16_t steering_pwm;
     int16_t steering_limit;
     int16_t base_abs;
     int16_t raw_turn_abs;
+    int16_t preview_yaw_x10;
+    uint8_t preview_valid;
     uint8_t turning_command;
     uint8_t pivot_command;
     int32_t left;
@@ -546,19 +616,25 @@ static void RearCar_ControlTask(void)
                          FOLLOW_MAX_BASE_PWM);
     car.mode = REAR_MODE_FOLLOWING;
 
-    raw_turn_abs = (delayed_packet->turn < 0) ?
-                   (int16_t)(-(int32_t)delayed_packet->turn) :
-                   delayed_packet->turn;
-    turning_command = (raw_turn_abs >= FOLLOW_TURN_DETECT_PWM) ? 1U : 0U;
-    if (turning_command != 0U) {
-        turn_pwm = clamp_i16(delayed_packet->turn,
+    front_yaw = FRONT_YAW_SIGN * ((float)delayed_packet->yaw / 10.0f);
+    preview_yaw_x10 = delayed_packet->yaw;
+    preview_valid = TrackBuffer_GetYawAt(
+        playback_target_front_um +
+        (uint64_t)FOLLOW_PREVIEW_DISTANCE_MM * 1000U,
+        &preview_yaw_x10);
+    preview_front_yaw = FRONT_YAW_SIGN * ((float)preview_yaw_x10 / 10.0f);
+    preview_yaw_delta = angle_error_deg(preview_front_yaw, front_yaw);
+
+    raw_turn_pwm = clamp_i16(delayed_packet->turn,
                              -FOLLOW_MAX_TURN_PWM,
                              FOLLOW_MAX_TURN_PWM);
-    } else {
-        turn_pwm = 0;
-    }
+    raw_turn_abs = (raw_turn_pwm < 0) ?
+                   (int16_t)(-(int32_t)raw_turn_pwm) : raw_turn_pwm;
+    turning_command = ((raw_turn_abs >= FOLLOW_TURN_DETECT_PWM) ||
+                       ((preview_valid != 0U) &&
+                        (fabsf(preview_yaw_delta) >=
+                         FOLLOW_CURVATURE_MIN_YAW_DEG))) ? 1U : 0U;
 
-    front_yaw = FRONT_YAW_SIGN * ((float)delayed_packet->yaw / 10.0f);
     if (heading_reference_valid == 0U) {
         front_yaw_reference = front_yaw;
         rear_yaw_reference = REAR_YAW_SIGN * Yaw_GetAngle();
@@ -573,6 +649,52 @@ static void RearCar_ControlTask(void)
     heading_error = angle_error_deg(rear_target_yaw,
                                     REAR_YAW_SIGN * Yaw_GetAngle());
 
+    path_base_abs = (base_pwm < 0) ? (int16_t)-base_pwm : base_pwm;
+    curvature_turn_pwm = raw_turn_pwm;
+    if ((preview_valid != 0U) &&
+        (path_base_abs >= FOLLOW_MIN_DRIVE_PWM) &&
+        (fabsf(preview_yaw_delta) >= FOLLOW_CURVATURE_MIN_YAW_DEG)) {
+        curvature_turn = (float)path_base_abs *
+                         (FOLLOW_EFFECTIVE_TRACK_MM * 0.5f) *
+                         (preview_yaw_delta * 0.0174532925f) /
+                         (float)FOLLOW_PREVIEW_DISTANCE_MM;
+        curvature_turn_pwm = clamp_i16((int32_t)curvature_turn,
+                                       -FOLLOW_MAX_TURN_PWM,
+                                       FOLLOW_MAX_TURN_PWM);
+
+        /* Reject a gyro-derived curvature direction that conflicts with turn. */
+        if ((raw_turn_abs >= FOLLOW_TURN_DETECT_PWM) &&
+            (((raw_turn_pwm > 0) && (curvature_turn_pwm < 0)) ||
+             ((raw_turn_pwm < 0) && (curvature_turn_pwm > 0)))) {
+            curvature_turn_pwm = raw_turn_pwm;
+        }
+    }
+
+    if (turning_command != 0U) {
+        target_turn_pwm = clamp_i16(
+            ((int32_t)curvature_turn_pwm * FOLLOW_CURVATURE_BLEND_PERCENT +
+             (int32_t)raw_turn_pwm *
+             (100 - FOLLOW_CURVATURE_BLEND_PERCENT)) / 100,
+            -FOLLOW_MAX_TURN_PWM,
+            FOLLOW_MAX_TURN_PWM);
+    } else {
+        target_turn_pwm = 0;
+    }
+
+    /* Do not keep steering after reaching the yaw of this path point. */
+    if (((target_turn_pwm > 0) && (heading_error <= 0.0f)) ||
+        ((target_turn_pwm < 0) && (heading_error >= 0.0f))) {
+        target_turn_pwm = 0;
+    }
+
+    turn_slew_delta = (int16_t)(target_turn_pwm -
+                                last_turn_feedforward_pwm);
+    turn_slew_delta = clamp_i16(turn_slew_delta,
+                                -FOLLOW_TURN_SLEW_PWM,
+                                FOLLOW_TURN_SLEW_PWM);
+    turn_pwm = (int16_t)(last_turn_feedforward_pwm + turn_slew_delta);
+    last_turn_feedforward_pwm = turn_pwm;
+
     RearCar_UpdateDistanceTrim(
         RearCar_CanUseUltrasonic(turning_command, heading_error));
     base_pwm = clamp_i16((int32_t)base_pwm + distance_trim_pwm,
@@ -580,14 +702,6 @@ static void RearCar_ControlTask(void)
                          FOLLOW_MAX_BASE_PWM);
     if ((delayed_packet->speed >= 0) && (base_pwm < 0)) {
         base_pwm = 0;
-    }
-
-    /* Stop the turn command after reaching this path point's target yaw. */
-    if (turning_command != 0U) {
-        if (((turn_pwm > 0) && (heading_error <= 0.0f)) ||
-            ((turn_pwm < 0) && (heading_error >= 0.0f))) {
-            turn_pwm = 0;
-        }
     }
 
     heading_pwm = HeadingPID_Update(rear_target_yaw,
