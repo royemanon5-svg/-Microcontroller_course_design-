@@ -623,6 +623,8 @@ static void RearCar_ControlTask(void)
                                     REAR_YAW_SIGN * Yaw_GetAngle());
 
     path_base_abs = (base_pwm < 0) ? (int16_t)-base_pwm : base_pwm;
+    pivot_command = ((path_base_abs < FOLLOW_MIN_DRIVE_PWM) &&
+                     (raw_turn_abs >= FOLLOW_PIVOT_TURN_PWM)) ? 1U : 0U;
     curvature_turn_pwm = raw_turn_pwm;
     if ((preview_valid != 0U) &&
         (path_base_abs >= FOLLOW_MIN_DRIVE_PWM) &&
@@ -643,7 +645,10 @@ static void RearCar_ControlTask(void)
         }
     }
 
-    if (turning_command != 0U) {
+    if (pivot_command != 0U) {
+        /* Replay the front car's in-place corner state at full recorded PWM. */
+        target_turn_pwm = raw_turn_pwm;
+    } else if (turning_command != 0U) {
         target_turn_pwm = clamp_i16(
             ((int32_t)curvature_turn_pwm * FOLLOW_CURVATURE_BLEND_PERCENT +
              (int32_t)raw_turn_pwm *
@@ -655,7 +660,7 @@ static void RearCar_ControlTask(void)
     }
 
     /* Reduce feedforward before the current path point's yaw is reached. */
-    if ((target_turn_pwm != 0) &&
+    if ((pivot_command == 0U) && (target_turn_pwm != 0) &&
         (fabsf(heading_error) < FOLLOW_TURN_BRAKE_ANGLE_DEG)) {
         target_turn_pwm = (int16_t)(
             (float)target_turn_pwm * fabsf(heading_error) /
@@ -663,31 +668,40 @@ static void RearCar_ControlTask(void)
     }
 
     /* Cut feedforward immediately after reaching or crossing target yaw. */
-    if (((target_turn_pwm > 0) && (heading_error <= 0.0f)) ||
-        ((target_turn_pwm < 0) && (heading_error >= 0.0f))) {
+    if ((pivot_command == 0U) &&
+        (((target_turn_pwm > 0) && (heading_error <= 0.0f)) ||
+         ((target_turn_pwm < 0) && (heading_error >= 0.0f)))) {
         target_turn_pwm = 0;
         last_turn_feedforward_pwm = 0;
     }
 
-    turn_slew_delta = (int16_t)(target_turn_pwm -
-                                last_turn_feedforward_pwm);
-    turn_slew_limit = ((target_turn_pwm == 0) ||
-                       (((target_turn_pwm > 0) ==
-                         (last_turn_feedforward_pwm > 0)) &&
-                        (((target_turn_pwm < 0) ? -target_turn_pwm :
-                          target_turn_pwm) <
-                         ((last_turn_feedforward_pwm < 0) ?
-                          -last_turn_feedforward_pwm :
-                          last_turn_feedforward_pwm)))) ?
-                      FOLLOW_TURN_FALL_SLEW_PWM :
-                      FOLLOW_TURN_RISE_SLEW_PWM;
-    turn_slew_delta = clamp_i16(turn_slew_delta,
-                                -turn_slew_limit,
-                                turn_slew_limit);
-    turn_pwm = (int16_t)(last_turn_feedforward_pwm + turn_slew_delta);
+    if (pivot_command != 0U) {
+        turn_pwm = target_turn_pwm;
+    } else {
+        turn_slew_delta = (int16_t)(target_turn_pwm -
+                                    last_turn_feedforward_pwm);
+        turn_slew_limit = ((target_turn_pwm == 0) ||
+                           (((target_turn_pwm > 0) ==
+                             (last_turn_feedforward_pwm > 0)) &&
+                            (((target_turn_pwm < 0) ? -target_turn_pwm :
+                              target_turn_pwm) <
+                             ((last_turn_feedforward_pwm < 0) ?
+                              -last_turn_feedforward_pwm :
+                              last_turn_feedforward_pwm)))) ?
+                          FOLLOW_TURN_FALL_SLEW_PWM :
+                          FOLLOW_TURN_RISE_SLEW_PWM;
+        turn_slew_delta = clamp_i16(turn_slew_delta,
+                                    -turn_slew_limit,
+                                    turn_slew_limit);
+        turn_pwm = (int16_t)(last_turn_feedforward_pwm + turn_slew_delta);
+    }
     last_turn_feedforward_pwm = turn_pwm;
 
-    RearCar_UpdateDistanceTrim(RearCar_CanUseUltrasonic(turning_command));
+    if (turning_command != 0U) {
+        distance_trim_pwm = 0;
+    } else {
+        RearCar_UpdateDistanceTrim(RearCar_CanUseUltrasonic(0U));
+    }
     base_pwm = clamp_i16((int32_t)base_pwm + distance_trim_pwm,
                          -FOLLOW_MAX_BASE_PWM,
                          FOLLOW_MAX_BASE_PWM);
@@ -700,9 +714,14 @@ static void RearCar_ControlTask(void)
                                     (float)FOLLOW_CONTROL_MS / 1000.0f,
                                     (float)FOLLOW_MAX_HEADING_PWM);
 
+    /* During pivot replay, heading feedback may assist but never oppose it. */
+    if ((pivot_command != 0U) &&
+        (((turn_pwm > 0) && (heading_pwm < 0.0f)) ||
+         ((turn_pwm < 0) && (heading_pwm > 0.0f)))) {
+        heading_pwm = 0.0f;
+    }
+
     base_abs = (base_pwm < 0) ? (int16_t)-base_pwm : base_pwm;
-    pivot_command = ((base_abs < FOLLOW_MIN_DRIVE_PWM) &&
-                     (raw_turn_abs >= FOLLOW_PIVOT_TURN_PWM)) ? 1U : 0U;
 
     /* A stopped front car must not trigger gyro-only rotation. */
     if ((base_abs < FOLLOW_MIN_DRIVE_PWM) && (pivot_command == 0U)) {
