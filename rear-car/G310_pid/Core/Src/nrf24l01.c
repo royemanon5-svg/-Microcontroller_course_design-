@@ -230,7 +230,7 @@ NRF24L01_Status NRF24L01_ReadPacket(NRF24L01_Packet *packet)
         }
     }
 
-    if (packet_checksum(payload) != payload[11]) {
+    if (packet_checksum(payload) != payload[12]) {
         return NRF24L01_CHECKSUM_ERROR;
     }
 
@@ -241,8 +241,9 @@ NRF24L01_Status NRF24L01_ReadPacket(NRF24L01_Packet *packet)
                          ((uint32_t)payload[7] << 8) |
                          ((uint32_t)payload[8] << 16) |
                          ((uint32_t)payload[9] << 24);
-    packet->seq = payload[10];
-    packet->checksum = payload[11];
+    packet->flags = payload[10];
+    packet->seq = payload[11];
+    packet->checksum = payload[12];
 
     /* A packet already read from the FIFO must not keep the link alive. */
     if ((sequence_valid != 0U) && (packet->seq == last_sequence)) {

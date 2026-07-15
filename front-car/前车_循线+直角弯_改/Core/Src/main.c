@@ -217,6 +217,7 @@ int main(void)
         int16_t speed = (int16_t)(((int32_t)left + right) / 2);
         int16_t turn = (int16_t)(((int32_t)right - left) / 2);
         int16_t yaw_x10 = (int16_t)(Yaw_GetAngle() * 10.0f);
+        uint8_t flags = (step == 3U) ? FRONT_CAR_FLAG_RIGHT_ANGLE : 0U;
         char radio_text[18];
 
         sprintf(radio_text, "V:%4d T:%4d", speed, turn);
@@ -228,7 +229,8 @@ int main(void)
             {
                 last_nrf_send = now;
                 g_nrf_tx_ok = (NRF24L01_SendCarData(speed, turn, yaw_x10,
-                                                    g_path_ticks) == NRF24L01_TX_OK);
+                                                    g_path_ticks, flags) ==
+                                   NRF24L01_TX_OK);
             }
             OLED_ShowString(2, 1, g_nrf_tx_ok ? "RF:OK Q:   " : "RF:ERR Q:  ");
             OLED_ShowNum(2, 9, NRF24L01_LastSequence(), 3);

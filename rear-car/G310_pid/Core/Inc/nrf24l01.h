@@ -3,14 +3,16 @@
 
 #include "main.h"
 
-#define NRF24L01_PAYLOAD_SIZE      12U
+#define NRF24L01_PAYLOAD_SIZE      13U
 #define NRF24L01_PACKET_TIMEOUT_MS 300U
+#define FRONT_CAR_FLAG_RIGHT_ANGLE 0x01U
 
 typedef struct {
     int16_t speed; //前车速度
     int16_t turn; //前车转向量
     int16_t yaw; //前车航向角
     uint32_t path_ticks; //前车累计编码器路程
+    uint8_t flags; //前车状态标志
     uint8_t seq; //包序号
     uint8_t checksum; //校验和
 } NRF24L01_Packet;
