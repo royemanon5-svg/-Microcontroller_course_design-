@@ -54,7 +54,7 @@ typedef struct {
 #define FOLLOW_DISTANCE_TARGET_CM 20
 #define FOLLOW_DISTANCE_DEADBAND_CM 2
 //间距控制Kp
-#define FOLLOW_DISTANCE_KP      2.0f//8.0f
+#define FOLLOW_DISTANCE_KP      1.0f//8.0f
 #define FOLLOW_DISTANCE_MAX_PWM 80
 #define FOLLOW_DISTANCE_STABLE_N 2U
 #define FOLLOW_DISTANCE_MAX_JUMP_CM 4U
@@ -94,7 +94,7 @@ typedef struct {
 #define REAR_TICKS_TO_MM_NUM    141372U
 #define REAR_TICKS_TO_MM_DEN    530634U
 /* Calibrate odometry here instead of changing the rear-car PWM. */
-#define REAR_PATH_SCALE_NUM     222U
+#define REAR_PATH_SCALE_NUM     223U
 #define REAR_PATH_SCALE_DEN     225U
 #define FOLLOW_PLAYBACK_DELAY_MM 200U //150
 #define FOLLOW_RIGHT_ANGLE_EXTRA_MM 100U //50
