@@ -14,7 +14,7 @@
 #define angle_Ki 0.0f //0.00
 #define angle_Kd 2.5f //2.5
 // 跟车航向 PID（实际控制周期由调用参数传入）
-#define HEADING_PID_KP              2.2f
+#define HEADING_PID_KP              3.0f //2.2f
 #define HEADING_PID_KI              0.08f
 #define HEADING_PID_KD              0.12f
 #define HEADING_PID_INTEGRAL_LIMIT  80.0f

@@ -50,12 +50,14 @@ typedef struct {
 #define FOLLOW_VALID_MIN_CM     3
 #define FOLLOW_VALID_MAX_CM     80
 #define FOLLOW_CONTROL_MIN_CM   10
-#define FOLLOW_CONTROL_MAX_CM   35
+//追赶范围的最大限制
+#define FOLLOW_CONTROL_MAX_CM   30 //35
 #define FOLLOW_START_DISTANCE_CM 20
 #define FOLLOW_START_CONFIRM_N  3U
 #define FOLLOW_DISTANCE_TARGET_CM 20
 #define FOLLOW_DISTANCE_DEADBAND_CM 2
-#define FOLLOW_DISTANCE_KP      8.0f
+//间距控制Kp
+#define FOLLOW_DISTANCE_KP      2.0f//8.0f
 #define FOLLOW_DISTANCE_MAX_PWM 80
 #define FOLLOW_DISTANCE_STABLE_N 2U
 #define FOLLOW_DISTANCE_MAX_JUMP_CM 4U
@@ -67,12 +69,19 @@ typedef struct {
 #define FOLLOW_PIVOT_TURN_PWM   60
 #define FOLLOW_CORNER_APPROACH_MAX_PWM 120
 #define FOLLOW_PREVIEW_DISTANCE_MM 5U
+#define FOLLOW_HEADING_TARGET_PREVIEW_MM 20U
+#define FOLLOW_STRAIGHT_STABLE_PACKETS 6U
+#define FOLLOW_STRAIGHT_STABLE_YAW_DEG 2.0f
 #define FOLLOW_EFFECTIVE_TRACK_MM 110.0f
 #define FOLLOW_CURVATURE_BLEND_PERCENT 10
 #define FOLLOW_CURVATURE_MIN_YAW_DEG 0.5f
 #define FOLLOW_TURN_RISE_SLEW_PWM 25
 #define FOLLOW_TURN_FALL_SLEW_PWM 80
 #define FOLLOW_TURN_BRAKE_ANGLE_DEG 25.0f
+//后车直角弯转的角度
+#define FOLLOW_RIGHT_ANGLE_GYRO_TARGET_DEG 73.0f
+#define FOLLOW_RIGHT_ANGLE_STOP_ERROR_DEG 3.0f
+#define FOLLOW_RIGHT_ANGLE_SETTLE_N 5U
 #define FRONT_YAW_SIGN          1.0f
 #define REAR_YAW_SIGN           1.0f
 #define FOLLOW_CONTROL_MS       10U
@@ -87,7 +96,11 @@ typedef struct {
 /* Calibrate odometry here instead of changing the rear-car PWM. */
 #define REAR_PATH_SCALE_NUM     1000U
 #define REAR_PATH_SCALE_DEN     1000U
-#define FOLLOW_PLAYBACK_DELAY_MM 150U
+#define FOLLOW_PLAYBACK_DELAY_MM 200U //150
+#define FOLLOW_RIGHT_ANGLE_EXTRA_MM 50U
+#define FOLLOW_RIGHT_ANGLE_EXTRA_TICKS \
+    ((FOLLOW_RIGHT_ANGLE_EXTRA_MM * FRONT_TICKS_TO_MM_DEN + \
+      FRONT_TICKS_TO_MM_NUM / 2U) / FRONT_TICKS_TO_MM_NUM)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -133,6 +146,14 @@ static float front_yaw_reference = 0.0f;
 static float rear_yaw_reference = 0.0f;
 static uint8_t heading_reference_valid = 0U;
 static uint8_t right_angle_approach_active = 0U;
+static uint32_t right_angle_path_offset_ticks = 0U;
+static uint8_t last_live_right_angle_flag = 0U;
+static uint8_t right_angle_turn_active = 0U;
+static uint8_t right_angle_finish_pending = 0U;
+static uint8_t right_angle_settle_count = 0U;
+static float right_angle_target_yaw = 0.0f;
+static uint8_t last_curve_turning_command = 0U;
+static uint8_t curve_exit_target_pending = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -162,6 +183,8 @@ static uint8_t TrackBuffer_StartPlayback(void);
 static uint8_t TrackBuffer_GetPlayback(NRF24L01_Packet *packet);
 static uint8_t TrackBuffer_GetYawAt(uint64_t target_front_um,
                                     int16_t *yaw_x10);
+static uint8_t TrackBuffer_GetStableStraightYaw(int16_t *yaw_x10);
+static uint8_t TrackBuffer_FinishRightAngle(void);
 static void RearCar_RecordPacket(const NRF24L01_Packet *packet);
 static uint8_t RearCar_CanUseUltrasonic(uint8_t turning_command);
 static void RearCar_UpdateDistanceTrim(uint8_t trusted);
@@ -295,6 +318,14 @@ static void TrackBuffer_Reset(void)
     last_turn_feedforward_pwm = 0;
     playback_target_front_um = 0U;
     right_angle_approach_active = 0U;
+    right_angle_path_offset_ticks = 0U;
+    last_live_right_angle_flag = 0U;
+    right_angle_turn_active = 0U;
+    right_angle_finish_pending = 0U;
+    right_angle_settle_count = 0U;
+    right_angle_target_yaw = 0.0f;
+    last_curve_turning_command = 0U;
+    curve_exit_target_pending = 0U;
 }
 
 static void TrackBuffer_Push(const NRF24L01_Packet *packet)
@@ -382,7 +413,10 @@ static uint8_t TrackBuffer_GetPlayback(NRF24L01_Packet *packet)
                                        FRONT_TICKS_TO_MM_NUM,
                                        FRONT_TICKS_TO_MM_DEN);
 
-        if ((next_um > anchor_um) && (target_front_um > anchor_um)) {
+        if ((next_um > anchor_um) && (target_front_um > anchor_um) &&
+            !(((next->flags & FRONT_CAR_FLAG_RIGHT_ANGLE) != 0U) &&
+              ((playback_anchor.flags &
+                FRONT_CAR_FLAG_RIGHT_ANGLE) == 0U))) {
             uint64_t position = target_front_um - anchor_um;
             uint64_t span = next_um - anchor_um;
 
@@ -448,12 +482,98 @@ static uint8_t TrackBuffer_GetYawAt(uint64_t target_front_um,
     return 1U;
 }
 
+static uint8_t TrackBuffer_GetStableStraightYaw(int16_t *yaw_x10)
+{
+    uint16_t index = track_tail;
+    uint16_t remaining = track_count;
+    uint8_t stable_count = 0U;
+    float reference_yaw = 0.0f;
+    float yaw_sum = 0.0f;
+
+    if (yaw_x10 == 0) {
+        return 0U;
+    }
+
+    while (remaining > 0U) {
+        const NRF24L01_Packet *point = &track_buffer[index].packet;
+        int16_t turn_abs = (point->turn < 0) ?
+            (int16_t)(-(int32_t)point->turn) : point->turn;
+
+        if (((point->flags & FRONT_CAR_FLAG_RIGHT_ANGLE) == 0U) &&
+            (turn_abs < FOLLOW_TURN_DETECT_PWM)) {
+            float point_yaw = FRONT_YAW_SIGN *
+                              ((float)point->yaw / 10.0f);
+
+            if (stable_count == 0U) {
+                reference_yaw = point_yaw;
+                yaw_sum = point_yaw;
+                stable_count = 1U;
+            } else {
+                float yaw_delta = angle_error_deg(point_yaw,
+                                                  reference_yaw);
+
+                if (fabsf(yaw_delta) <= FOLLOW_STRAIGHT_STABLE_YAW_DEG) {
+                    yaw_sum += reference_yaw + yaw_delta;
+                    stable_count++;
+                } else {
+                    reference_yaw = point_yaw;
+                    yaw_sum = point_yaw;
+                    stable_count = 1U;
+                }
+            }
+
+            if (stable_count >= FOLLOW_STRAIGHT_STABLE_PACKETS) {
+                float average_yaw = normalize_angle_deg(
+                    yaw_sum / (float)stable_count);
+                *yaw_x10 = (int16_t)(average_yaw * 10.0f +
+                    ((average_yaw >= 0.0f) ? 0.5f : -0.5f));
+                return 1U;
+            }
+        } else {
+            stable_count = 0U;
+            yaw_sum = 0.0f;
+        }
+
+        index = (uint16_t)((index + 1U) % TRACK_BUFFER_SIZE);
+        remaining--;
+    }
+
+    return 0U;
+}
+
+static uint8_t TrackBuffer_FinishRightAngle(void)
+{
+    if ((playback_anchor_valid != 0U) &&
+        ((playback_anchor.flags & FRONT_CAR_FLAG_RIGHT_ANGLE) == 0U)) {
+        return 1U;
+    }
+
+    while (track_count > 0U) {
+        const NRF24L01_Packet *point = &track_buffer[track_tail].packet;
+
+        if ((point->flags & FRONT_CAR_FLAG_RIGHT_ANGLE) == 0U) {
+            playback_anchor = *point;
+            playback_anchor_valid = 1U;
+            track_tail = (uint16_t)((track_tail + 1U) % TRACK_BUFFER_SIZE);
+            track_count--;
+            return 1U;
+        }
+
+        track_tail = (uint16_t)((track_tail + 1U) % TRACK_BUFFER_SIZE);
+        track_count--;
+    }
+
+    return 0U;
+}
+
 static void RearCar_RecordPacket(const NRF24L01_Packet *packet)
 {
     int16_t speed_abs = (packet->speed < 0) ?
                         (int16_t)(-(int32_t)packet->speed) : packet->speed;
     int16_t turn_abs = (packet->turn < 0) ?
                        (int16_t)(-(int32_t)packet->turn) : packet->turn;
+    NRF24L01_Packet buffered_packet;
+    uint8_t right_angle_flag;
 
     car.radio = *packet;
     if (front_motion_seen == 0U) {
@@ -461,11 +581,23 @@ static void RearCar_RecordPacket(const NRF24L01_Packet *packet)
             (turn_abs >= FOLLOW_PIVOT_TURN_PWM)) {
             TrackBuffer_Reset();
             front_motion_seen = 1U;
-            TrackBuffer_Push(packet);
         }
-    } else {
-        TrackBuffer_Push(packet);
     }
+
+    if (front_motion_seen != 0U) {
+        buffered_packet = *packet;
+        right_angle_flag =
+            ((packet->flags & FRONT_CAR_FLAG_RIGHT_ANGLE) != 0U) ? 1U : 0U;
+        if ((right_angle_flag != 0U) &&
+            (last_live_right_angle_flag == 0U)) {
+            right_angle_path_offset_ticks +=
+                FOLLOW_RIGHT_ANGLE_EXTRA_TICKS;
+        }
+        last_live_right_angle_flag = right_angle_flag;
+        buffered_packet.path_ticks += right_angle_path_offset_ticks;
+        TrackBuffer_Push(&buffered_packet);
+    }
+
     if ((packet->flags & FRONT_CAR_FLAG_RIGHT_ANGLE) != 0U) {
         right_angle_approach_active = 1U;
     }
@@ -516,6 +648,8 @@ static void RearCar_Stop(void)
     Motor_SetPWM(0, 0);
     HeadingPID_Reset();
     last_turn_feedforward_pwm = 0;
+    last_curve_turning_command = 0U;
+    curve_exit_target_pending = 0U;
 }
 
 static void RearCar_ControlTask(void)
@@ -523,9 +657,13 @@ static void RearCar_ControlTask(void)
     float front_yaw;
     float preview_front_yaw;
     float preview_yaw_delta;
+    float heading_preview_front_yaw;
+    float stable_straight_front_yaw;
     float curvature_turn;
     float heading_error;
     float heading_pwm;
+    float right_angle_error;
+    float right_angle_error_abs;
     int16_t base_pwm;
     int16_t path_base_abs;
     int16_t raw_turn_pwm;
@@ -538,8 +676,13 @@ static void RearCar_ControlTask(void)
     int16_t steering_limit;
     int16_t base_abs;
     int16_t raw_turn_abs;
+    int16_t right_angle_turn_pwm;
     int16_t preview_yaw_x10;
+    int16_t heading_preview_yaw_x10;
+    int16_t stable_straight_yaw_x10;
     uint8_t preview_valid;
+    uint8_t heading_preview_valid;
+    uint8_t stable_straight_valid;
     uint8_t turning_command;
     uint8_t pivot_command;
     int32_t left;
@@ -603,12 +746,92 @@ static void RearCar_ControlTask(void)
         &preview_yaw_x10);
     preview_front_yaw = FRONT_YAW_SIGN * ((float)preview_yaw_x10 / 10.0f);
     preview_yaw_delta = angle_error_deg(preview_front_yaw, front_yaw);
+    heading_preview_yaw_x10 = delayed_packet->yaw;
+    heading_preview_valid = TrackBuffer_GetYawAt(
+        playback_target_front_um +
+        (uint64_t)FOLLOW_HEADING_TARGET_PREVIEW_MM * 1000U,
+        &heading_preview_yaw_x10);
+    heading_preview_front_yaw = FRONT_YAW_SIGN *
+                                ((float)heading_preview_yaw_x10 / 10.0f);
 
     raw_turn_pwm = clamp_i16(delayed_packet->turn,
                              -FOLLOW_MAX_TURN_PWM,
                              FOLLOW_MAX_TURN_PWM);
     raw_turn_abs = (raw_turn_pwm < 0) ?
                    (int16_t)(-(int32_t)raw_turn_pwm) : raw_turn_pwm;
+
+    if (right_angle_finish_pending != 0U) {
+        if (TrackBuffer_FinishRightAngle() == 0U) {
+            RearCar_Stop();
+            return;
+        }
+
+        car.delayed_radio = playback_anchor;
+        front_yaw_reference = FRONT_YAW_SIGN *
+                              ((float)playback_anchor.yaw / 10.0f);
+        rear_yaw_reference = right_angle_target_yaw;
+        rear_target_yaw = right_angle_target_yaw;
+        heading_reference_valid = 1U;
+        right_angle_finish_pending = 0U;
+        right_angle_approach_active = 0U;
+        HeadingPID_Reset();
+        last_turn_feedforward_pwm = 0;
+        RearCar_Stop();
+        return;
+    }
+
+    if (((delayed_packet->flags & FRONT_CAR_FLAG_RIGHT_ANGLE) != 0U) &&
+        (right_angle_turn_active == 0U)) {
+        right_angle_target_yaw = normalize_angle_deg(
+            REAR_YAW_SIGN * Yaw_GetAngle() +
+            ((raw_turn_pwm >= 0) ? FOLLOW_RIGHT_ANGLE_GYRO_TARGET_DEG :
+                                   -FOLLOW_RIGHT_ANGLE_GYRO_TARGET_DEG));
+        rear_target_yaw = right_angle_target_yaw;
+        right_angle_turn_active = 1U;
+        right_angle_settle_count = 0U;
+        distance_trim_pwm = 0;
+        last_turn_feedforward_pwm = 0;
+        HeadingPID_Reset();
+    }
+
+    if (right_angle_turn_active != 0U) {
+        right_angle_error = angle_error_deg(
+            right_angle_target_yaw, REAR_YAW_SIGN * Yaw_GetAngle());
+        right_angle_error_abs = fabsf(right_angle_error);
+        right_angle_turn_pwm = 0;
+
+        if (right_angle_error_abs <= FOLLOW_RIGHT_ANGLE_STOP_ERROR_DEG) {
+            if (right_angle_settle_count < FOLLOW_RIGHT_ANGLE_SETTLE_N) {
+                right_angle_settle_count++;
+            }
+        } else {
+            right_angle_settle_count = 0U;
+            right_angle_turn_pwm = (right_angle_error > 0.0f) ?
+                                   TURN_MAX_PWM : -TURN_MAX_PWM;
+            if (right_angle_error_abs <= FOLLOW_TURN_BRAKE_ANGLE_DEG) {
+                right_angle_turn_pwm = (right_angle_error > 0.0f) ?
+                                       TURN_MIN_PWM : -TURN_MIN_PWM;
+            }
+        }
+
+        if (right_angle_settle_count >= FOLLOW_RIGHT_ANGLE_SETTLE_N) {
+            right_angle_turn_active = 0U;
+            right_angle_finish_pending = 1U;
+            right_angle_settle_count = 0U;
+            rear_target_yaw = right_angle_target_yaw;
+            HeadingPID_Reset();
+            last_turn_feedforward_pwm = 0;
+            RearCar_Stop();
+            return;
+        }
+
+        car.left_pwm = (int16_t)-right_angle_turn_pwm;
+        car.right_pwm = right_angle_turn_pwm;
+        car.mode = REAR_MODE_FOLLOWING;
+        Motor_SetPWM(car.left_pwm, car.right_pwm);
+        return;
+    }
+
     if ((delayed_packet->flags & FRONT_CAR_FLAG_RIGHT_ANGLE) != 0U) {
         right_angle_approach_active = 0U;
     }
@@ -627,10 +850,39 @@ static void RearCar_ControlTask(void)
         heading_reference_valid = 1U;
     }
 
+    stable_straight_valid = 0U;
     if (turning_command != 0U) {
+        curve_exit_target_pending = 0U;
         rear_target_yaw = normalize_angle_deg(rear_yaw_reference +
             angle_error_deg(front_yaw, front_yaw_reference));
+    } else {
+        if (last_curve_turning_command != 0U) {
+            curve_exit_target_pending = 1U;
+            HeadingPID_Reset();
+        }
+
+        if (curve_exit_target_pending != 0U) {
+            stable_straight_valid = TrackBuffer_GetStableStraightYaw(
+                &stable_straight_yaw_x10);
+            if (stable_straight_valid != 0U) {
+                stable_straight_front_yaw =
+                    (float)stable_straight_yaw_x10 / 10.0f;
+                rear_target_yaw = normalize_angle_deg(rear_yaw_reference +
+                    angle_error_deg(stable_straight_front_yaw,
+                                    front_yaw_reference));
+                front_yaw_reference = stable_straight_front_yaw;
+                rear_yaw_reference = rear_target_yaw;
+                curve_exit_target_pending = 0U;
+                HeadingPID_Reset();
+            } else {
+                rear_target_yaw = normalize_angle_deg(rear_yaw_reference +
+                    angle_error_deg((heading_preview_valid != 0U) ?
+                                    heading_preview_front_yaw : front_yaw,
+                                    front_yaw_reference));
+            }
+        }
     }
+    last_curve_turning_command = turning_command;
     heading_error = angle_error_deg(rear_target_yaw,
                                     REAR_YAW_SIGN * Yaw_GetAngle());
 
