@@ -42,7 +42,10 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
+#define POST_CORNER_SLOW_MM          250U
+#define POST_CORNER_TARGET_SPEED     14
+#define POST_CORNER_SLOW_TICKS \
+    ((POST_CORNER_SLOW_MM * 530634U + 141372U / 2U) / 141372U)
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -95,6 +98,8 @@ volatile uint16_t turn_ticks = 0;
 volatile uint8_t  turn_lost_line = 0;
 volatile uint32_t corner_lock = 0;
 volatile uint8_t  corner_dir = 0;    // 0=左转 1=右转
+volatile uint8_t  post_corner_slow_active = 0U;
+volatile uint32_t post_corner_slow_start_ticks = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -265,6 +270,8 @@ int main(void)
                 PID_SpeedL.integral = 0; PID_SpeedR.integral = 0;
                 OLED_Clear();
                 OLED_ShowString(1, 1, "Tracking...");
+                post_corner_slow_start_ticks = g_path_ticks;
+                post_corner_slow_active = 1U;
                 step = 1;
             }
         }
@@ -741,6 +748,28 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                 }
             }
             debug_pos = (int16_t)Tracking_Task((int16_t *)Target_speed);
+            if (post_corner_slow_active != 0U)
+            {
+                uint32_t slow_ticks = g_path_ticks -
+                                      post_corner_slow_start_ticks;
+
+                if (slow_ticks >= POST_CORNER_SLOW_TICKS)
+                {
+                    post_corner_slow_active = 0U;
+                }
+                else
+                {
+                    int16_t average_target = (int16_t)(
+                        ((int32_t)Target_speed[0] + Target_speed[1]) / 2);
+                    if (average_target > POST_CORNER_TARGET_SPEED)
+                    {
+                        int16_t reduction = (int16_t)(
+                            average_target - POST_CORNER_TARGET_SPEED);
+                        Target_speed[0] = (int16_t)(Target_speed[0] - reduction);
+                        Target_speed[1] = (int16_t)(Target_speed[1] - reduction);
+                    }
+                }
+            }
             int16_t out_L = PID_Caculate(&PID_SpeedL, (float)Target_speed[0] - last_speedL);
             int16_t out_R = PID_Caculate(&PID_SpeedR, (float)Target_speed[1] - last_speedR);
             g_motor_cmd_left = out_L;

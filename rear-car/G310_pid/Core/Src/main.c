@@ -49,9 +49,6 @@ typedef struct {
 /* USER CODE BEGIN PD */
 #define FOLLOW_VALID_MIN_CM     3
 #define FOLLOW_VALID_MAX_CM     80
-#define FOLLOW_CONTROL_MIN_CM   10
-//追赶范围的最大限制
-#define FOLLOW_CONTROL_MAX_CM   30 //35
 #define FOLLOW_START_DISTANCE_CM 20
 #define FOLLOW_START_CONFIRM_N  3U
 #define FOLLOW_DISTANCE_TARGET_CM 20
@@ -61,6 +58,8 @@ typedef struct {
 #define FOLLOW_DISTANCE_MAX_PWM 80
 #define FOLLOW_DISTANCE_STABLE_N 2U
 #define FOLLOW_DISTANCE_MAX_JUMP_CM 4U
+#define FOLLOW_DISTANCE_ESTIMATE_MIN_MM 50.0f
+#define FOLLOW_DISTANCE_ESTIMATE_MAX_MM 800.0f
 #define FOLLOW_MAX_BASE_PWM     999
 #define FOLLOW_MAX_TURN_PWM     999
 #define FOLLOW_MAX_HEADING_PWM  120
@@ -79,7 +78,7 @@ typedef struct {
 #define FOLLOW_TURN_FALL_SLEW_PWM 80
 #define FOLLOW_TURN_BRAKE_ANGLE_DEG 25.0f
 //后车直角弯转的角度
-#define FOLLOW_RIGHT_ANGLE_GYRO_TARGET_DEG 73.0f
+#define FOLLOW_RIGHT_ANGLE_GYRO_TARGET_DEG 80.0f//73
 #define FOLLOW_RIGHT_ANGLE_STOP_ERROR_DEG 3.0f
 #define FOLLOW_RIGHT_ANGLE_SETTLE_N 5U
 #define FRONT_YAW_SIGN          1.0f
@@ -93,11 +92,16 @@ typedef struct {
 #define FRONT_TICKS_TO_MM_DEN   530634U
 #define REAR_TICKS_TO_MM_NUM    141372U
 #define REAR_TICKS_TO_MM_DEN    530634U
+#define FOLLOW_POST_CORNER_GUARD_MM 100U
+#define FOLLOW_POST_CORNER_MAX_PWM 30
+#define FOLLOW_POST_CORNER_GUARD_TICKS \
+    ((FOLLOW_POST_CORNER_GUARD_MM * REAR_TICKS_TO_MM_DEN + \
+      REAR_TICKS_TO_MM_NUM / 2U) / REAR_TICKS_TO_MM_NUM)
 /* Calibrate odometry here instead of changing the rear-car PWM. */
 #define REAR_PATH_SCALE_NUM     1000U
 #define REAR_PATH_SCALE_DEN     1000U
 #define FOLLOW_PLAYBACK_DELAY_MM 200U //150
-#define FOLLOW_RIGHT_ANGLE_EXTRA_MM 50U
+#define FOLLOW_RIGHT_ANGLE_EXTRA_MM 100U //50
 #define FOLLOW_RIGHT_ANGLE_EXTRA_TICKS \
     ((FOLLOW_RIGHT_ANGLE_EXTRA_MM * FRONT_TICKS_TO_MM_DEN + \
       FRONT_TICKS_TO_MM_NUM / 2U) / FRONT_TICKS_TO_MM_NUM)
@@ -135,12 +139,18 @@ static volatile uint32_t rear_path_ticks = 0U;
 static volatile uint32_t rear_odometer_ticks = 0U;
 static volatile uint8_t rear_path_half_tick = 0U;
 static volatile uint8_t rear_odometer_half_tick = 0U;
+static volatile uint8_t rear_path_paused = 0U;
 static uint64_t front_path_origin_um = 0U;
 static uint8_t distance_stable_count = 0U;
 static uint16_t last_raw_distance_cm = 0U;
 static int16_t distance_trim_pwm = 0;
 static int16_t last_turn_feedforward_pwm = 0;
 static uint64_t playback_target_front_um = 0U;
+static float estimated_distance_mm = 0.0f;
+static uint64_t estimator_last_front_um = 0U;
+static uint64_t estimator_last_rear_um = 0U;
+static uint8_t estimated_distance_valid = 0U;
+static uint8_t estimator_path_anchor_valid = 0U;
 static float rear_target_yaw = 0.0f;
 static float front_yaw_reference = 0.0f;
 static float rear_yaw_reference = 0.0f;
@@ -152,6 +162,8 @@ static uint8_t right_angle_turn_active = 0U;
 static uint8_t right_angle_finish_pending = 0U;
 static uint8_t right_angle_settle_count = 0U;
 static float right_angle_target_yaw = 0.0f;
+static uint8_t post_corner_chase_limited = 0U;
+static uint32_t post_corner_chase_start_ticks = 0U;
 static uint8_t last_curve_turning_command = 0U;
 static uint8_t curve_exit_target_pending = 0U;
 /* USER CODE END PV */
@@ -186,8 +198,8 @@ static uint8_t TrackBuffer_GetYawAt(uint64_t target_front_um,
 static uint8_t TrackBuffer_GetStableStraightYaw(int16_t *yaw_x10);
 static uint8_t TrackBuffer_FinishRightAngle(void);
 static void RearCar_RecordPacket(const NRF24L01_Packet *packet);
-static uint8_t RearCar_CanUseUltrasonic(uint8_t turning_command);
-static void RearCar_UpdateDistanceTrim(uint8_t trusted);
+static void RearCar_PredictDistance(void);
+static void RearCar_UpdateDistanceTrim(void);
 static void RearCar_ControlTask(void);
 static void RearCar_UpdateOLED(void);
 /* USER CODE END PFP */
@@ -314,9 +326,15 @@ static void TrackBuffer_Reset(void)
     playback_active = 0U;
     rear_path_ticks = 0U;
     rear_path_half_tick = 0U;
+    rear_path_paused = 0U;
     distance_trim_pwm = 0;
     last_turn_feedforward_pwm = 0;
     playback_target_front_um = 0U;
+    estimated_distance_mm = 0.0f;
+    estimator_last_front_um = 0U;
+    estimator_last_rear_um = 0U;
+    estimated_distance_valid = 0U;
+    estimator_path_anchor_valid = 0U;
     right_angle_approach_active = 0U;
     right_angle_path_offset_ticks = 0U;
     last_live_right_angle_flag = 0U;
@@ -324,6 +342,8 @@ static void TrackBuffer_Reset(void)
     right_angle_finish_pending = 0U;
     right_angle_settle_count = 0U;
     right_angle_target_yaw = 0.0f;
+    post_corner_chase_limited = 0U;
+    post_corner_chase_start_ticks = 0U;
     last_curve_turning_command = 0U;
     curve_exit_target_pending = 0U;
 }
@@ -352,6 +372,14 @@ static uint8_t TrackBuffer_StartPlayback(void)
                                       FRONT_TICKS_TO_MM_DEN);
     rear_path_ticks = 0U;
     rear_path_half_tick = 0U;
+    rear_path_paused = 0U;
+    estimated_distance_mm = (car.distance_valid != 0U) ?
+                            (float)car.distance_cm * 10.0f :
+                            (float)FOLLOW_DISTANCE_TARGET_CM * 10.0f;
+    estimated_distance_valid = 1U;
+    estimator_path_anchor_valid = 0U;
+    post_corner_chase_limited = 0U;
+    post_corner_chase_start_ticks = 0U;
     playback_anchor_valid = 0U;
     playback_active = 1U;
     return 1U;
@@ -603,33 +631,81 @@ static void RearCar_RecordPacket(const NRF24L01_Packet *packet)
     }
 }
 
-static uint8_t RearCar_CanUseUltrasonic(uint8_t turning_command)
+static void RearCar_PredictDistance(void)
 {
-    if ((turning_command != 0U) || (car.distance_valid == 0U) ||
-        (distance_stable_count < FOLLOW_DISTANCE_STABLE_N) ||
-        (car.distance_cm < FOLLOW_CONTROL_MIN_CM) ||
-        (car.distance_cm > FOLLOW_CONTROL_MAX_CM)) {
-        return 0U;
+    uint64_t front_um = ticks_to_um(car.radio.path_ticks,
+                                    FRONT_TICKS_TO_MM_NUM,
+                                    FRONT_TICKS_TO_MM_DEN);
+    uint64_t rear_um = ticks_to_um(rear_path_ticks,
+                                   REAR_TICKS_TO_MM_NUM,
+                                   REAR_TICKS_TO_MM_DEN);
+    uint64_t scaled_rear_um = ((rear_um * REAR_PATH_SCALE_NUM) +
+                               (REAR_PATH_SCALE_DEN / 2U)) /
+                              REAR_PATH_SCALE_DEN;
+
+    if (estimator_path_anchor_valid != 0U) {
+        int64_t front_delta_um = (front_um >= estimator_last_front_um) ?
+            (int64_t)(front_um - estimator_last_front_um) : 0;
+        int64_t rear_delta_um = (scaled_rear_um >= estimator_last_rear_um) ?
+            (int64_t)(scaled_rear_um - estimator_last_rear_um) : 0;
+
+        /* Wheel motion during an in-place corner is not forward distance. */
+        if (last_live_right_angle_flag != 0U) {
+            front_delta_um = 0;
+        }
+        if ((right_angle_turn_active != 0U) ||
+            (right_angle_finish_pending != 0U) ||
+            ((car.delayed_radio.flags &
+              FRONT_CAR_FLAG_RIGHT_ANGLE) != 0U)) {
+            rear_delta_um = 0;
+        }
+
+        if (estimated_distance_valid != 0U) {
+            estimated_distance_mm +=
+                (float)(front_delta_um - rear_delta_um) / 1000.0f;
+            if (estimated_distance_mm < FOLLOW_DISTANCE_ESTIMATE_MIN_MM) {
+                estimated_distance_mm = FOLLOW_DISTANCE_ESTIMATE_MIN_MM;
+            } else if (estimated_distance_mm >
+                       FOLLOW_DISTANCE_ESTIMATE_MAX_MM) {
+                estimated_distance_mm = FOLLOW_DISTANCE_ESTIMATE_MAX_MM;
+            }
+        }
+    } else {
+        estimator_path_anchor_valid = 1U;
     }
-    return 1U;
+
+    estimator_last_front_um = front_um;
+    estimator_last_rear_um = scaled_rear_um;
 }
 
-static void RearCar_UpdateDistanceTrim(uint8_t trusted)
+static void RearCar_UpdateDistanceTrim(void)
 {
     int16_t target_trim = 0;
-    int16_t error_cm;
+    int16_t positive_limit = FOLLOW_DISTANCE_MAX_PWM;
     int16_t delta;
     int16_t step;
 
-    if (trusted != 0U) {
-        error_cm = (int16_t)car.distance_cm - FOLLOW_DISTANCE_TARGET_CM;
-        if ((error_cm >= -FOLLOW_DISTANCE_DEADBAND_CM) &&
-            (error_cm <= FOLLOW_DISTANCE_DEADBAND_CM)) {
-            error_cm = 0;
+    if (post_corner_chase_limited != 0U) {
+        if ((rear_path_ticks - post_corner_chase_start_ticks) >=
+            FOLLOW_POST_CORNER_GUARD_TICKS) {
+            post_corner_chase_limited = 0U;
+        } else {
+            positive_limit = FOLLOW_POST_CORNER_MAX_PWM;
         }
-        target_trim = clamp_i16((int32_t)((float)error_cm * FOLLOW_DISTANCE_KP),
-                                -FOLLOW_DISTANCE_MAX_PWM,
-                                FOLLOW_DISTANCE_MAX_PWM);
+    }
+
+    if (estimated_distance_valid != 0U) {
+        float error_mm = estimated_distance_mm -
+                         (float)FOLLOW_DISTANCE_TARGET_CM * 10.0f;
+
+        if (fabsf(error_mm) <=
+            (float)FOLLOW_DISTANCE_DEADBAND_CM * 10.0f) {
+            error_mm = 0.0f;
+        }
+        target_trim = clamp_i16(
+            (int32_t)((error_mm / 10.0f) * FOLLOW_DISTANCE_KP),
+            -FOLLOW_DISTANCE_MAX_PWM,
+            positive_limit);
     }
 
     delta = (int16_t)(target_trim - distance_trim_pwm);
@@ -759,6 +835,7 @@ static void RearCar_ControlTask(void)
                              FOLLOW_MAX_TURN_PWM);
     raw_turn_abs = (raw_turn_pwm < 0) ?
                    (int16_t)(-(int32_t)raw_turn_pwm) : raw_turn_pwm;
+    RearCar_PredictDistance();
 
     if (right_angle_finish_pending != 0U) {
         if (TrackBuffer_FinishRightAngle() == 0U) {
@@ -774,6 +851,9 @@ static void RearCar_ControlTask(void)
         heading_reference_valid = 1U;
         right_angle_finish_pending = 0U;
         right_angle_approach_active = 0U;
+        rear_path_paused = 0U;
+        post_corner_chase_start_ticks = rear_path_ticks;
+        post_corner_chase_limited = 1U;
         HeadingPID_Reset();
         last_turn_feedforward_pwm = 0;
         RearCar_Stop();
@@ -787,6 +867,7 @@ static void RearCar_ControlTask(void)
             ((raw_turn_pwm >= 0) ? FOLLOW_RIGHT_ANGLE_GYRO_TARGET_DEG :
                                    -FOLLOW_RIGHT_ANGLE_GYRO_TARGET_DEG));
         rear_target_yaw = right_angle_target_yaw;
+        rear_path_paused = 1U;
         right_angle_turn_active = 1U;
         right_angle_settle_count = 0U;
         distance_trim_pwm = 0;
@@ -963,11 +1044,7 @@ static void RearCar_ControlTask(void)
     }
     last_turn_feedforward_pwm = turn_pwm;
 
-    if (turning_command != 0U) {
-        distance_trim_pwm = 0;
-    } else {
-        RearCar_UpdateDistanceTrim(RearCar_CanUseUltrasonic(0U));
-    }
+    RearCar_UpdateDistanceTrim();
     base_pwm = clamp_i16((int32_t)base_pwm + distance_trim_pwm,
                          -FOLLOW_MAX_BASE_PWM,
                          FOLLOW_MAX_BASE_PWM);
@@ -1494,7 +1571,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
         rear_odometer_ticks += odometer_sum / 2U;
         rear_odometer_half_tick = (uint8_t)(odometer_sum & 1U);
-        if (playback_active != 0U) {
+        if ((playback_active != 0U) && (rear_path_paused == 0U)) {
             uint32_t path_sum = tick_sum + rear_path_half_tick;
             rear_path_ticks += path_sum / 2U;
             rear_path_half_tick = (uint8_t)(path_sum & 1U);
