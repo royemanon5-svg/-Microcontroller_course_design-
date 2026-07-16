@@ -10,7 +10,7 @@ extern UART_HandleTypeDef huart1;
 #define MAX_SPEED           50
 #define MIN_SPEED           -50
 #define MAX_CORRECTION      20
-#define TRACK_BASE_SPEED    20
+#define TRACK_BASE_SPEED    25 //20
 
 extern float ErrorLInt, ErrorRInt;
 
@@ -89,7 +89,7 @@ int16_t GetWeightedPosition(void)
     }
     else
     {
-        last_valid_pos = sum / count + 40 ;
+        last_valid_pos = sum / count ;
         return last_valid_pos;
     }
 }

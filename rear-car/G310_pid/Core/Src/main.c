@@ -63,6 +63,7 @@ typedef struct {
 #define FOLLOW_MAX_BASE_PWM     999
 #define FOLLOW_MAX_TURN_PWM     999
 #define FOLLOW_MAX_HEADING_PWM  120
+#define FOLLOW_STRAIGHT_TRIM_PWM (-8)
 #define FOLLOW_MIN_DRIVE_PWM    20
 #define FOLLOW_TURN_DETECT_PWM  40
 #define FOLLOW_PIVOT_TURN_PWM   60
@@ -92,14 +93,9 @@ typedef struct {
 #define FRONT_TICKS_TO_MM_DEN   530634U
 #define REAR_TICKS_TO_MM_NUM    141372U
 #define REAR_TICKS_TO_MM_DEN    530634U
-#define FOLLOW_POST_CORNER_GUARD_MM 100U
-#define FOLLOW_POST_CORNER_MAX_PWM 30
-#define FOLLOW_POST_CORNER_GUARD_TICKS \
-    ((FOLLOW_POST_CORNER_GUARD_MM * REAR_TICKS_TO_MM_DEN + \
-      REAR_TICKS_TO_MM_NUM / 2U) / REAR_TICKS_TO_MM_NUM)
 /* Calibrate odometry here instead of changing the rear-car PWM. */
-#define REAR_PATH_SCALE_NUM     1000U
-#define REAR_PATH_SCALE_DEN     1000U
+#define REAR_PATH_SCALE_NUM     222U
+#define REAR_PATH_SCALE_DEN     225U
 #define FOLLOW_PLAYBACK_DELAY_MM 200U //150
 #define FOLLOW_RIGHT_ANGLE_EXTRA_MM 100U //50
 #define FOLLOW_RIGHT_ANGLE_EXTRA_TICKS \
@@ -162,8 +158,6 @@ static uint8_t right_angle_turn_active = 0U;
 static uint8_t right_angle_finish_pending = 0U;
 static uint8_t right_angle_settle_count = 0U;
 static float right_angle_target_yaw = 0.0f;
-static uint8_t post_corner_chase_limited = 0U;
-static uint32_t post_corner_chase_start_ticks = 0U;
 static uint8_t last_curve_turning_command = 0U;
 static uint8_t curve_exit_target_pending = 0U;
 /* USER CODE END PV */
@@ -342,8 +336,6 @@ static void TrackBuffer_Reset(void)
     right_angle_finish_pending = 0U;
     right_angle_settle_count = 0U;
     right_angle_target_yaw = 0.0f;
-    post_corner_chase_limited = 0U;
-    post_corner_chase_start_ticks = 0U;
     last_curve_turning_command = 0U;
     curve_exit_target_pending = 0U;
 }
@@ -378,8 +370,6 @@ static uint8_t TrackBuffer_StartPlayback(void)
                             (float)FOLLOW_DISTANCE_TARGET_CM * 10.0f;
     estimated_distance_valid = 1U;
     estimator_path_anchor_valid = 0U;
-    post_corner_chase_limited = 0U;
-    post_corner_chase_start_ticks = 0U;
     playback_anchor_valid = 0U;
     playback_active = 1U;
     return 1U;
@@ -681,18 +671,8 @@ static void RearCar_PredictDistance(void)
 static void RearCar_UpdateDistanceTrim(void)
 {
     int16_t target_trim = 0;
-    int16_t positive_limit = FOLLOW_DISTANCE_MAX_PWM;
     int16_t delta;
     int16_t step;
-
-    if (post_corner_chase_limited != 0U) {
-        if ((rear_path_ticks - post_corner_chase_start_ticks) >=
-            FOLLOW_POST_CORNER_GUARD_TICKS) {
-            post_corner_chase_limited = 0U;
-        } else {
-            positive_limit = FOLLOW_POST_CORNER_MAX_PWM;
-        }
-    }
 
     if (estimated_distance_valid != 0U) {
         float error_mm = estimated_distance_mm -
@@ -705,7 +685,7 @@ static void RearCar_UpdateDistanceTrim(void)
         target_trim = clamp_i16(
             (int32_t)((error_mm / 10.0f) * FOLLOW_DISTANCE_KP),
             -FOLLOW_DISTANCE_MAX_PWM,
-            positive_limit);
+            FOLLOW_DISTANCE_MAX_PWM);
     }
 
     delta = (int16_t)(target_trim - distance_trim_pwm);
@@ -852,8 +832,6 @@ static void RearCar_ControlTask(void)
         right_angle_finish_pending = 0U;
         right_angle_approach_active = 0U;
         rear_path_paused = 0U;
-        post_corner_chase_start_ticks = rear_path_ticks;
-        post_corner_chase_limited = 1U;
         HeadingPID_Reset();
         last_turn_feedforward_pwm = 0;
         RearCar_Stop();
@@ -1061,6 +1039,10 @@ static void RearCar_ControlTask(void)
                                     REAR_YAW_SIGN * Yaw_GetAngle(),
                                     (float)FOLLOW_CONTROL_MS / 1000.0f,
                                     (float)FOLLOW_MAX_HEADING_PWM);
+
+    if ((turning_command == 0U) && (pivot_command == 0U)) {
+        heading_pwm += (float)FOLLOW_STRAIGHT_TRIM_PWM;
+    }
 
     /* During pivot replay, heading feedback may assist but never oppose it. */
     if ((pivot_command != 0U) &&
