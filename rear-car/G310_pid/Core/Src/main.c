@@ -101,15 +101,6 @@ typedef struct {
 #define FOLLOW_CORNER_HOLD_MAX_MM 220.0f
 #define FOLLOW_CORNER_RESTART_DISTANCE_CM 25U
 #define FOLLOW_CORNER_CATCHUP_PWM 100
-/* Straight-line wheel position synchronization loop. */
-#define FOLLOW_POSITION_KP       0.30f
-#define FOLLOW_POSITION_KI       0.00f
-#define FOLLOW_POSITION_KD       0.15f
-#define FOLLOW_POSITION_MAX_PWM  30.0f
-#define FOLLOW_POSITION_I_LIMIT  200.0f
-#define FOLLOW_POSITION_CONFIRM_N 10U
-#define FOLLOW_POSITION_RIGHT_SCALE_NUM 1000L
-#define FOLLOW_POSITION_RIGHT_SCALE_DEN 1000L
 #define FOLLOW_RIGHT_ANGLE_EXTRA_TICKS \
     ((FOLLOW_RIGHT_ANGLE_EXTRA_MM * FRONT_TICKS_TO_MM_DEN + \
       FRONT_TICKS_TO_MM_NUM / 2U) / FRONT_TICKS_TO_MM_NUM)
@@ -175,15 +166,6 @@ static uint8_t curve_exit_target_pending = 0U;
 static uint8_t rear_ack_corner_id = 0U;
 static uint8_t rear_ack_state = NRF24L01_REAR_STATE_NORMAL;
 static uint8_t right_angle_exit_catchup_active = 0U;
-static volatile int32_t rear_left_position_ticks = 0;
-static volatile int32_t rear_right_position_ticks = 0;
-static int32_t position_left_anchor_ticks = 0;
-static int32_t position_right_anchor_ticks = 0;
-static float position_integral = 0.0f;
-static float position_last_error = 0.0f;
-static float position_derivative = 0.0f;
-static uint8_t position_error_valid = 0U;
-static uint8_t position_straight_count = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -218,8 +200,6 @@ static uint8_t TrackBuffer_FinishRightAngle(void);
 static void RearCar_RecordPacket(const NRF24L01_Packet *packet);
 static void RearCar_PredictDistance(void);
 static void RearCar_UpdateDistanceTrim(void);
-static void PositionSync_Reset(void);
-static float PositionSync_Update(uint8_t straight_enabled);
 static void RearCar_ControlTask(void);
 static void RearCar_UpdateOLED(void);
 /* USER CODE END PFP */
@@ -747,76 +727,6 @@ static void RearCar_UpdateDistanceTrim(void)
     distance_trim_pwm = (int16_t)(distance_trim_pwm + step);
 }
 
-static void PositionSync_Reset(void)
-{
-    position_left_anchor_ticks = rear_left_position_ticks;
-    position_right_anchor_ticks = rear_right_position_ticks;
-    position_integral = 0.0f;
-    position_last_error = 0.0f;
-    position_derivative = 0.0f;
-    position_error_valid = 0U;
-    position_straight_count = 0U;
-}
-
-static float PositionSync_Update(uint8_t straight_enabled)
-{
-    int32_t left_ticks = rear_left_position_ticks;
-    int32_t right_ticks = rear_right_position_ticks;
-    int32_t left_delta;
-    int32_t right_delta;
-    int32_t scaled_right_delta;
-    float error;
-    float derivative = 0.0f;
-    float output;
-
-    if (straight_enabled == 0U) {
-        PositionSync_Reset();
-        return 0.0f;
-    }
-
-    if (position_straight_count < FOLLOW_POSITION_CONFIRM_N) {
-        position_straight_count++;
-        position_left_anchor_ticks = left_ticks;
-        position_right_anchor_ticks = right_ticks;
-        position_error_valid = 0U;
-        return 0.0f;
-    }
-
-    left_delta = left_ticks - position_left_anchor_ticks;
-    right_delta = right_ticks - position_right_anchor_ticks;
-    scaled_right_delta = (int32_t)(
-        ((int64_t)right_delta * FOLLOW_POSITION_RIGHT_SCALE_NUM) /
-        FOLLOW_POSITION_RIGHT_SCALE_DEN);
-    error = (float)(left_delta - scaled_right_delta);
-
-    if (position_error_valid != 0U) {
-        derivative = error - position_last_error;
-        position_derivative += 0.25f *
-                               (derivative - position_derivative);
-    } else {
-        position_error_valid = 1U;
-    }
-
-    position_integral += error * ((float)FOLLOW_CONTROL_MS / 1000.0f);
-    if (position_integral > FOLLOW_POSITION_I_LIMIT) {
-        position_integral = FOLLOW_POSITION_I_LIMIT;
-    } else if (position_integral < -FOLLOW_POSITION_I_LIMIT) {
-        position_integral = -FOLLOW_POSITION_I_LIMIT;
-    }
-
-    output = FOLLOW_POSITION_KP * error +
-             FOLLOW_POSITION_KI * position_integral +
-             FOLLOW_POSITION_KD * position_derivative;
-    if (output > FOLLOW_POSITION_MAX_PWM) {
-        output = FOLLOW_POSITION_MAX_PWM;
-    } else if (output < -FOLLOW_POSITION_MAX_PWM) {
-        output = -FOLLOW_POSITION_MAX_PWM;
-    }
-
-    position_last_error = error;
-    return output;
-}
-
 static void RearCar_Stop(void)
 {
     car.left_pwm = 0;
@@ -827,7 +737,6 @@ static void RearCar_Stop(void)
     last_turn_feedforward_pwm = 0;
     last_curve_turning_command = 0U;
     curve_exit_target_pending = 0U;
-    PositionSync_Reset();
 }
 
 static void RearCar_ControlTask(void)
@@ -840,7 +749,6 @@ static void RearCar_ControlTask(void)
     float curvature_turn;
     float heading_error;
     float heading_pwm;
-    float position_pwm;
     float right_angle_error;
     float right_angle_error_abs;
     int16_t base_pwm;
@@ -864,7 +772,6 @@ static void RearCar_ControlTask(void)
     uint8_t stable_straight_valid;
     uint8_t turning_command;
     uint8_t pivot_command;
-    uint8_t position_straight_enabled;
     int32_t left;
     int32_t right;
     uint32_t now = HAL_GetTick();
@@ -1201,11 +1108,6 @@ static void RearCar_ControlTask(void)
         base_pwm = FOLLOW_CORNER_CATCHUP_PWM;
     }
 
-    position_straight_enabled = ((turning_command == 0U) &&
-                                 (pivot_command == 0U) &&
-                                 (base_pwm >= FOLLOW_MIN_DRIVE_PWM)) ? 1U : 0U;
-    position_pwm = PositionSync_Update(position_straight_enabled);
-
     /* During pivot replay, heading feedback may assist but never oppose it. */
     if ((pivot_command != 0U) &&
         (((turn_pwm > 0) && (heading_pwm < 0.0f)) ||
@@ -1221,8 +1123,7 @@ static void RearCar_ControlTask(void)
         return;
     }
 
-    steering_pwm = clamp_i16((int32_t)turn_pwm + (int32_t)heading_pwm +
-                             (int32_t)position_pwm,
+    steering_pwm = clamp_i16((int32_t)turn_pwm + (int32_t)heading_pwm,
                              -FOLLOW_MAX_TURN_PWM,
                              FOLLOW_MAX_TURN_PWM);
 
@@ -1712,8 +1613,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     speed_r = (int16_t)(-(int32_t)speed_r);
     last_speedL = speed_l;
     last_speedR = speed_r;
-    rear_left_position_ticks += speed_l;
-    rear_right_position_ticks += speed_r;
     {
         uint16_t left_ticks = (speed_l < 0) ?
                               (uint16_t)(-(int32_t)speed_l) :
