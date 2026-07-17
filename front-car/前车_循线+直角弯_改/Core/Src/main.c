@@ -52,6 +52,11 @@
     ((CROSS_MIN_TRAVEL_MM * 530634U + 141372U / 2U) / 141372U)
 #define CROSS_MAX_TRAVEL_TICKS \
     ((CROSS_MAX_TRAVEL_MM * 530634U + 141372U / 2U) / 141372U)
+#define CORNER_EXIT_ADVANCE_MM       400U
+#define CORNER_EXIT_TARGET_SPEED     15
+#define CORNER_WAIT_TIMEOUT_MS       8000U
+#define CORNER_EXIT_ADVANCE_TICKS \
+    ((CORNER_EXIT_ADVANCE_MM * 530634U + 141372U / 2U) / 141372U)
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -108,6 +113,12 @@ volatile uint8_t  cross_active = 0U;
 volatile uint8_t  cross_detect_count = 0U;
 volatile uint8_t  cross_exit_count = 0U;
 volatile uint32_t cross_start_path_ticks = 0U;
+volatile uint8_t  corner_id = 0U;
+volatile uint32_t corner_exit_start_ticks = 0U;
+volatile uint32_t corner_wait_start_ms = 0U;
+volatile uint8_t  g_rear_ack_valid = 0U;
+volatile uint8_t  g_rear_ack_corner_id = 0U;
+volatile uint8_t  g_rear_ack_state = NRF24L01_REAR_STATE_NORMAL;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -230,8 +241,18 @@ int main(void)
         int16_t speed = (int16_t)(((int32_t)left + right) / 2);
         int16_t turn = (int16_t)(((int32_t)right - left) / 2);
         int16_t yaw_x10 = (int16_t)(Yaw_GetAngle() * 10.0f);
-        uint8_t flags = (step == 3U) ? FRONT_CAR_FLAG_RIGHT_ANGLE : 0U;
+        uint8_t flags = 0U;
         char radio_text[18];
+
+        if (step == 2U) flags = FRONT_CAR_FLAG_CORNER_APPROACH;
+        else if (step == 3U) flags = FRONT_CAR_FLAG_RIGHT_ANGLE;
+        else if (step == 4U) flags = FRONT_CAR_FLAG_CORNER_EXIT;
+        else if (step == 5U) flags = FRONT_CAR_FLAG_WAIT_REAR;
+        if ((step >= 2U) && (step <= 5U))
+        {
+            flags |= (uint8_t)((corner_id << FRONT_CAR_CORNER_ID_SHIFT) &
+                               FRONT_CAR_CORNER_ID_MASK);
+        }
 
         sprintf(radio_text, "V:%4d T:%4d", speed, turn);
         OLED_ShowString(1, 1, radio_text);
@@ -241,9 +262,17 @@ int main(void)
             if ((uint32_t)(now - last_nrf_send) >= 20U)
             {
                 last_nrf_send = now;
+                NRF24L01_RearAck rear_ack;
                 g_nrf_tx_ok = (NRF24L01_SendCarData(speed, turn, yaw_x10,
                                                     g_path_ticks, flags) ==
                                    NRF24L01_TX_OK);
+                if ((g_nrf_tx_ok != 0U) &&
+                    (NRF24L01_GetRearAck(&rear_ack, 300U) != 0U))
+                {
+                    g_rear_ack_valid = 1U;
+                    g_rear_ack_corner_id = rear_ack.corner_id;
+                    g_rear_ack_state = rear_ack.rear_state;
+                }
             }
             OLED_ShowString(2, 1, g_nrf_tx_ok ? "RF:OK Q:   " : "RF:ERR Q:  ");
             OLED_ShowNum(2, 9, NRF24L01_LastSequence(), 3);
@@ -277,8 +306,9 @@ int main(void)
                 corner_lock = HAL_GetTick() + CORNER_LOCK_MS;
                 PID_SpeedL.integral = 0; PID_SpeedR.integral = 0;
                 OLED_Clear();
-                OLED_ShowString(1, 1, "Tracking...");
-                step = 1;
+                corner_exit_start_ticks = g_path_ticks;
+                OLED_ShowString(1, 1, "Corner exit");
+                step = 4;
             }
         }
         else line_detect_count = 0;
@@ -724,8 +754,15 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                                    (uint16_t)last_speedR;
             uint32_t tick_sum = (uint32_t)left_ticks + right_ticks +
                                 g_path_half_tick;
-            g_path_ticks += tick_sum / 2U;
-            g_path_half_tick = (uint8_t)(tick_sum & 1U);
+            if (step != 3U)
+            {
+                g_path_ticks += tick_sum / 2U;
+                g_path_half_tick = (uint8_t)(tick_sum & 1U);
+            }
+            else
+            {
+                g_path_half_tick = 0U;
+            }
         }
         Yaw_Update();
 
@@ -829,6 +866,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                     {
                         corner_det = 0;
                         turn_ticks = 0;
+                        corner_id = (corner_id >= 15U) ? 1U :
+                                    (uint8_t)(corner_id + 1U);
+                        g_rear_ack_valid = 0U;
                         OLED_Clear();
                         OLED_ShowString(1, 1, corner_dir ? "TURN RIGHT" : "TURN LEFT");
                         step = 2;
@@ -879,6 +919,66 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             g_motor_cmd_left = L;
             g_motor_cmd_right = R;
             Motor_SetPWM(L, R);
+        }
+        else if (step == 4)
+        {
+            int16_t average_speed;
+            int16_t speed_reduction;
+            int16_t out_L;
+            int16_t out_R;
+
+            debug_pos = (int16_t)Tracking_Task((int16_t *)Target_speed);
+            average_speed = (int16_t)(((int32_t)Target_speed[0] +
+                                       Target_speed[1]) / 2);
+            if (average_speed > CORNER_EXIT_TARGET_SPEED)
+            {
+                speed_reduction = (int16_t)(average_speed -
+                                             CORNER_EXIT_TARGET_SPEED);
+                Target_speed[0] = (int16_t)(Target_speed[0] - speed_reduction);
+                Target_speed[1] = (int16_t)(Target_speed[1] - speed_reduction);
+            }
+            out_L = PID_Caculate(&PID_SpeedL,
+                                  (float)Target_speed[0] - last_speedL);
+            out_R = PID_Caculate(&PID_SpeedR,
+                                  (float)Target_speed[1] - last_speedR);
+            g_motor_cmd_left = out_L;
+            g_motor_cmd_right = out_R;
+            Motor_SetPWM(out_L, out_R);
+
+            if ((g_path_ticks - corner_exit_start_ticks) >=
+                CORNER_EXIT_ADVANCE_TICKS)
+            {
+                g_motor_cmd_left = 0;
+                g_motor_cmd_right = 0;
+                Target_speed[0] = 0;
+                Target_speed[1] = 0;
+                Motor_SetPWM(0, 0);
+                corner_wait_start_ms = HAL_GetTick();
+                step = 5;
+            }
+        }
+        else if (step == 5)
+        {
+            g_motor_cmd_left = 0;
+            g_motor_cmd_right = 0;
+            Target_speed[0] = 0;
+            Target_speed[1] = 0;
+            Motor_SetPWM(0, 0);
+
+            if (((g_rear_ack_valid != 0U) &&
+                 (g_rear_ack_corner_id == corner_id) &&
+                 (g_rear_ack_state == NRF24L01_REAR_STATE_DONE)) ||
+                ((uint32_t)(HAL_GetTick() - corner_wait_start_ms) >=
+                 CORNER_WAIT_TIMEOUT_MS))
+            {
+                Tracking_Reset();
+                corner_lock = HAL_GetTick() + CORNER_LOCK_MS;
+                PID_SpeedL.integral = 0;
+                PID_SpeedR.integral = 0;
+                PID_SpeedL.last_error = 0;
+                PID_SpeedR.last_error = 0;
+                step = 1;
+            }
         }
     }
 }

@@ -63,7 +63,7 @@ typedef struct {
 #define FOLLOW_MAX_BASE_PWM     999
 #define FOLLOW_MAX_TURN_PWM     999
 #define FOLLOW_MAX_HEADING_PWM  120
-#define FOLLOW_STRAIGHT_TRIM_PWM (-8)
+#define FOLLOW_STRAIGHT_TRIM_PWM (-6)
 #define FOLLOW_MIN_DRIVE_PWM    20
 #define FOLLOW_TURN_DETECT_PWM  40
 #define FOLLOW_PIVOT_TURN_PWM   60
@@ -79,7 +79,7 @@ typedef struct {
 #define FOLLOW_TURN_FALL_SLEW_PWM 80
 #define FOLLOW_TURN_BRAKE_ANGLE_DEG 25.0f
 //后车直角弯转的角度
-#define FOLLOW_RIGHT_ANGLE_GYRO_TARGET_DEG 80.0f//73
+#define FOLLOW_RIGHT_ANGLE_GYRO_TARGET_DEG 76.0f//73
 #define FOLLOW_RIGHT_ANGLE_STOP_ERROR_DEG 3.0f
 #define FOLLOW_RIGHT_ANGLE_SETTLE_N 5U
 #define FRONT_YAW_SIGN          1.0f
@@ -97,7 +97,19 @@ typedef struct {
 #define REAR_PATH_SCALE_NUM     223U
 #define REAR_PATH_SCALE_DEN     225U
 #define FOLLOW_PLAYBACK_DELAY_MM 200U //150
-#define FOLLOW_RIGHT_ANGLE_EXTRA_MM 100U //50
+#define FOLLOW_RIGHT_ANGLE_EXTRA_MM 0U
+#define FOLLOW_CORNER_HOLD_MAX_MM 220.0f
+#define FOLLOW_CORNER_RESTART_DISTANCE_CM 25U
+#define FOLLOW_CORNER_CATCHUP_PWM 100
+/* Straight-line wheel position synchronization loop. */
+#define FOLLOW_POSITION_KP       0.30f
+#define FOLLOW_POSITION_KI       0.00f
+#define FOLLOW_POSITION_KD       0.15f
+#define FOLLOW_POSITION_MAX_PWM  30.0f
+#define FOLLOW_POSITION_I_LIMIT  200.0f
+#define FOLLOW_POSITION_CONFIRM_N 10U
+#define FOLLOW_POSITION_RIGHT_SCALE_NUM 1000L
+#define FOLLOW_POSITION_RIGHT_SCALE_DEN 1000L
 #define FOLLOW_RIGHT_ANGLE_EXTRA_TICKS \
     ((FOLLOW_RIGHT_ANGLE_EXTRA_MM * FRONT_TICKS_TO_MM_DEN + \
       FRONT_TICKS_TO_MM_NUM / 2U) / FRONT_TICKS_TO_MM_NUM)
@@ -160,6 +172,18 @@ static uint8_t right_angle_settle_count = 0U;
 static float right_angle_target_yaw = 0.0f;
 static uint8_t last_curve_turning_command = 0U;
 static uint8_t curve_exit_target_pending = 0U;
+static uint8_t rear_ack_corner_id = 0U;
+static uint8_t rear_ack_state = NRF24L01_REAR_STATE_NORMAL;
+static uint8_t right_angle_exit_catchup_active = 0U;
+static volatile int32_t rear_left_position_ticks = 0;
+static volatile int32_t rear_right_position_ticks = 0;
+static int32_t position_left_anchor_ticks = 0;
+static int32_t position_right_anchor_ticks = 0;
+static float position_integral = 0.0f;
+static float position_last_error = 0.0f;
+static float position_derivative = 0.0f;
+static uint8_t position_error_valid = 0U;
+static uint8_t position_straight_count = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -194,6 +218,8 @@ static uint8_t TrackBuffer_FinishRightAngle(void);
 static void RearCar_RecordPacket(const NRF24L01_Packet *packet);
 static void RearCar_PredictDistance(void);
 static void RearCar_UpdateDistanceTrim(void);
+static void PositionSync_Reset(void);
+static float PositionSync_Update(uint8_t straight_enabled);
 static void RearCar_ControlTask(void);
 static void RearCar_UpdateOLED(void);
 /* USER CODE END PFP */
@@ -338,6 +364,9 @@ static void TrackBuffer_Reset(void)
     right_angle_target_yaw = 0.0f;
     last_curve_turning_command = 0U;
     curve_exit_target_pending = 0U;
+    rear_ack_corner_id = 0U;
+    rear_ack_state = NRF24L01_REAR_STATE_NORMAL;
+    right_angle_exit_catchup_active = 0U;
 }
 
 static void TrackBuffer_Push(const NRF24L01_Packet *packet)
@@ -592,8 +621,30 @@ static void RearCar_RecordPacket(const NRF24L01_Packet *packet)
                        (int16_t)(-(int32_t)packet->turn) : packet->turn;
     NRF24L01_Packet buffered_packet;
     uint8_t right_angle_flag;
+    uint8_t packet_corner_id = (uint8_t)(
+        (packet->flags & FRONT_CAR_CORNER_ID_MASK) >>
+        FRONT_CAR_CORNER_ID_SHIFT);
+    uint8_t corner_flags = (uint8_t)(packet->flags &
+        (FRONT_CAR_FLAG_CORNER_APPROACH |
+         FRONT_CAR_FLAG_RIGHT_ANGLE |
+         FRONT_CAR_FLAG_CORNER_EXIT |
+         FRONT_CAR_FLAG_WAIT_REAR));
 
     car.radio = *packet;
+    if (corner_flags != 0U) {
+        if (packet_corner_id != rear_ack_corner_id) {
+            rear_ack_corner_id = packet_corner_id;
+            rear_ack_state = NRF24L01_REAR_STATE_APPROACH;
+        } else if ((rear_ack_state == NRF24L01_REAR_STATE_NORMAL) &&
+                   ((packet->flags &
+                     (FRONT_CAR_FLAG_CORNER_APPROACH |
+                      FRONT_CAR_FLAG_RIGHT_ANGLE)) != 0U)) {
+            rear_ack_state = NRF24L01_REAR_STATE_APPROACH;
+        }
+    } else if (rear_ack_state == NRF24L01_REAR_STATE_DONE) {
+        rear_ack_state = NRF24L01_REAR_STATE_NORMAL;
+        right_angle_exit_catchup_active = 0U;
+    }
     if (front_motion_seen == 0U) {
         if ((speed_abs >= FOLLOW_MIN_DRIVE_PWM) ||
             (turn_abs >= FOLLOW_PIVOT_TURN_PWM)) {
@@ -696,6 +747,76 @@ static void RearCar_UpdateDistanceTrim(void)
     distance_trim_pwm = (int16_t)(distance_trim_pwm + step);
 }
 
+static void PositionSync_Reset(void)
+{
+    position_left_anchor_ticks = rear_left_position_ticks;
+    position_right_anchor_ticks = rear_right_position_ticks;
+    position_integral = 0.0f;
+    position_last_error = 0.0f;
+    position_derivative = 0.0f;
+    position_error_valid = 0U;
+    position_straight_count = 0U;
+}
+
+static float PositionSync_Update(uint8_t straight_enabled)
+{
+    int32_t left_ticks = rear_left_position_ticks;
+    int32_t right_ticks = rear_right_position_ticks;
+    int32_t left_delta;
+    int32_t right_delta;
+    int32_t scaled_right_delta;
+    float error;
+    float derivative = 0.0f;
+    float output;
+
+    if (straight_enabled == 0U) {
+        PositionSync_Reset();
+        return 0.0f;
+    }
+
+    if (position_straight_count < FOLLOW_POSITION_CONFIRM_N) {
+        position_straight_count++;
+        position_left_anchor_ticks = left_ticks;
+        position_right_anchor_ticks = right_ticks;
+        position_error_valid = 0U;
+        return 0.0f;
+    }
+
+    left_delta = left_ticks - position_left_anchor_ticks;
+    right_delta = right_ticks - position_right_anchor_ticks;
+    scaled_right_delta = (int32_t)(
+        ((int64_t)right_delta * FOLLOW_POSITION_RIGHT_SCALE_NUM) /
+        FOLLOW_POSITION_RIGHT_SCALE_DEN);
+    error = (float)(left_delta - scaled_right_delta);
+
+    if (position_error_valid != 0U) {
+        derivative = error - position_last_error;
+        position_derivative += 0.25f *
+                               (derivative - position_derivative);
+    } else {
+        position_error_valid = 1U;
+    }
+
+    position_integral += error * ((float)FOLLOW_CONTROL_MS / 1000.0f);
+    if (position_integral > FOLLOW_POSITION_I_LIMIT) {
+        position_integral = FOLLOW_POSITION_I_LIMIT;
+    } else if (position_integral < -FOLLOW_POSITION_I_LIMIT) {
+        position_integral = -FOLLOW_POSITION_I_LIMIT;
+    }
+
+    output = FOLLOW_POSITION_KP * error +
+             FOLLOW_POSITION_KI * position_integral +
+             FOLLOW_POSITION_KD * position_derivative;
+    if (output > FOLLOW_POSITION_MAX_PWM) {
+        output = FOLLOW_POSITION_MAX_PWM;
+    } else if (output < -FOLLOW_POSITION_MAX_PWM) {
+        output = -FOLLOW_POSITION_MAX_PWM;
+    }
+
+    position_last_error = error;
+    return output;
+}
+
 static void RearCar_Stop(void)
 {
     car.left_pwm = 0;
@@ -706,6 +827,7 @@ static void RearCar_Stop(void)
     last_turn_feedforward_pwm = 0;
     last_curve_turning_command = 0U;
     curve_exit_target_pending = 0U;
+    PositionSync_Reset();
 }
 
 static void RearCar_ControlTask(void)
@@ -718,6 +840,7 @@ static void RearCar_ControlTask(void)
     float curvature_turn;
     float heading_error;
     float heading_pwm;
+    float position_pwm;
     float right_angle_error;
     float right_angle_error_abs;
     int16_t base_pwm;
@@ -741,6 +864,7 @@ static void RearCar_ControlTask(void)
     uint8_t stable_straight_valid;
     uint8_t turning_command;
     uint8_t pivot_command;
+    uint8_t position_straight_enabled;
     int32_t left;
     int32_t right;
     uint32_t now = HAL_GetTick();
@@ -817,6 +941,30 @@ static void RearCar_ControlTask(void)
                    (int16_t)(-(int32_t)raw_turn_pwm) : raw_turn_pwm;
     RearCar_PredictDistance();
 
+    if ((right_angle_exit_catchup_active != 0U) &&
+        (car.distance_valid != 0U) &&
+        (distance_stable_count >= FOLLOW_DISTANCE_STABLE_N) &&
+        (car.distance_cm <= FOLLOW_CORNER_RESTART_DISTANCE_CM)) {
+        right_angle_exit_catchup_active = 0U;
+        rear_ack_state = NRF24L01_REAR_STATE_DONE;
+        distance_trim_pwm = 0;
+        RearCar_Stop();
+        car.mode = REAR_MODE_FOLLOWING;
+        return;
+    }
+
+    if (((car.radio.flags &
+          (FRONT_CAR_FLAG_CORNER_APPROACH |
+           FRONT_CAR_FLAG_RIGHT_ANGLE)) != 0U) &&
+        ((delayed_packet->flags & FRONT_CAR_FLAG_RIGHT_ANGLE) == 0U) &&
+        (estimated_distance_valid != 0U) &&
+        (estimated_distance_mm <= FOLLOW_CORNER_HOLD_MAX_MM)) {
+        distance_trim_pwm = 0;
+        RearCar_Stop();
+        car.mode = REAR_MODE_FOLLOWING;
+        return;
+    }
+
     if (right_angle_finish_pending != 0U) {
         if (TrackBuffer_FinishRightAngle() == 0U) {
             RearCar_Stop();
@@ -830,6 +978,8 @@ static void RearCar_ControlTask(void)
         rear_target_yaw = right_angle_target_yaw;
         heading_reference_valid = 1U;
         right_angle_finish_pending = 0U;
+        rear_ack_state = NRF24L01_REAR_STATE_CATCHUP;
+        right_angle_exit_catchup_active = 1U;
         right_angle_approach_active = 0U;
         rear_path_paused = 0U;
         HeadingPID_Reset();
@@ -847,6 +997,7 @@ static void RearCar_ControlTask(void)
         rear_target_yaw = right_angle_target_yaw;
         rear_path_paused = 1U;
         right_angle_turn_active = 1U;
+        rear_ack_state = NRF24L01_REAR_STATE_TURNING;
         right_angle_settle_count = 0U;
         distance_trim_pwm = 0;
         last_turn_feedforward_pwm = 0;
@@ -1043,6 +1194,17 @@ static void RearCar_ControlTask(void)
     if ((turning_command == 0U) && (pivot_command == 0U)) {
         heading_pwm += (float)FOLLOW_STRAIGHT_TRIM_PWM;
     }
+    if ((right_angle_exit_catchup_active != 0U) &&
+        (car.distance_valid != 0U) &&
+        (car.distance_cm > FOLLOW_CORNER_RESTART_DISTANCE_CM) &&
+        (base_pwm < FOLLOW_CORNER_CATCHUP_PWM)) {
+        base_pwm = FOLLOW_CORNER_CATCHUP_PWM;
+    }
+
+    position_straight_enabled = ((turning_command == 0U) &&
+                                 (pivot_command == 0U) &&
+                                 (base_pwm >= FOLLOW_MIN_DRIVE_PWM)) ? 1U : 0U;
+    position_pwm = PositionSync_Update(position_straight_enabled);
 
     /* During pivot replay, heading feedback may assist but never oppose it. */
     if ((pivot_command != 0U) &&
@@ -1059,7 +1221,8 @@ static void RearCar_ControlTask(void)
         return;
     }
 
-    steering_pwm = clamp_i16((int32_t)turn_pwm + (int32_t)heading_pwm,
+    steering_pwm = clamp_i16((int32_t)turn_pwm + (int32_t)heading_pwm +
+                             (int32_t)position_pwm,
                              -FOLLOW_MAX_TURN_PWM,
                              FOLLOW_MAX_TURN_PWM);
 
@@ -1175,12 +1338,14 @@ int main(void)
     uint32_t now = HAL_GetTick();
     NRF24L01_Packet packet;
     NRF24L01_Status radio_status;
+    uint8_t ack_refresh_needed = 0U;
 
     /* Drain the three-entry NRF RX FIFO before running slower peripheral tasks. */
     for (uint8_t read_count = 0U; read_count < 3U; read_count++) {
         radio_status = NRF24L01_ReadPacket(&packet);
         if (radio_status == NRF24L01_OK) {
             RearCar_RecordPacket(&packet);
+            ack_refresh_needed = 1U;
         } else if ((radio_status == NRF24L01_NO_DATA) ||
                    (radio_status == NRF24L01_SPI_ERROR)) {
             break;
@@ -1191,6 +1356,12 @@ int main(void)
     if ((uint32_t)(now - last_control_tick) >= FOLLOW_CONTROL_MS) {
         last_control_tick = now;
         RearCar_ControlTask();
+    }
+
+    if (ack_refresh_needed != 0U) {
+        (void)NRF24L01_QueueAckStatus(rear_ack_corner_id,
+                                     rear_ack_state,
+                                     rear_path_ticks);
     }
 
     if ((uint32_t)(now - last_distance_tick) >= FOLLOW_DISTANCE_MS) {
@@ -1541,6 +1712,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     speed_r = (int16_t)(-(int32_t)speed_r);
     last_speedL = speed_l;
     last_speedR = speed_r;
+    rear_left_position_ticks += speed_l;
+    rear_right_position_ticks += speed_r;
     {
         uint16_t left_ticks = (speed_l < 0) ?
                               (uint16_t)(-(int32_t)speed_l) :

@@ -2,7 +2,10 @@
 
 #define NRF_CMD_R_REGISTER       0x00U
 #define NRF_CMD_W_REGISTER       0x20U
+#define NRF_CMD_ACTIVATE         0x50U
 #define NRF_CMD_R_RX_PAYLOAD     0x61U
+#define NRF_CMD_W_ACK_PAYLOAD_P0 0xA8U
+#define NRF_CMD_FLUSH_TX         0xE1U
 #define NRF_CMD_FLUSH_RX         0xE2U
 #define NRF_CMD_NOP              0xFFU
 
@@ -33,6 +36,7 @@ static uint32_t last_packet_tick = 0;
 static uint8_t module_ready = 0U;
 static uint8_t last_sequence = 0U;
 static uint8_t sequence_valid = 0U;
+static uint8_t ack_sequence = 0U;
 //CSN = 0：选中 NRF24L01，开始 SPI 通信  CSN = 1：取消选中
 static void csn_low(void)
 {
@@ -128,6 +132,35 @@ static NRF24L01_Status send_command(uint8_t cmd)
     return ret;
 }
 
+static NRF24L01_Status activate_features(void)
+{
+    uint8_t tx[2] = {NRF_CMD_ACTIVATE, 0x73U};
+    uint8_t rx[2] = {0};
+    NRF24L01_Status ret;
+
+    csn_low();
+    ret = spi_txrx(tx, rx, 2U);
+    csn_high();
+    return ret;
+}
+
+static NRF24L01_Status write_ack_payload(const uint8_t *payload, uint8_t len)
+{
+    uint8_t tx[NRF24L01_ACK_PAYLOAD_SIZE + 1U] = {0};
+    uint8_t rx[NRF24L01_ACK_PAYLOAD_SIZE + 1U] = {0};
+    NRF24L01_Status ret;
+    uint8_t i;
+
+    tx[0] = NRF_CMD_W_ACK_PAYLOAD_P0;
+    for (i = 0U; i < len; i++) {
+        tx[i + 1U] = payload[i];
+    }
+    csn_low();
+    ret = spi_txrx(tx, rx, (uint16_t)(len + 1U));
+    csn_high();
+    return ret;
+}
+
 static uint8_t packet_checksum(const uint8_t *data)
 {
     uint8_t sum = 0;
@@ -145,6 +178,7 @@ NRF24L01_Status NRF24L01_Init(void)
     module_ready = 0U;
     last_packet_tick = 0U;
     sequence_valid = 0U;
+    ack_sequence = 0U;
 
     ce_low(); // CE引脚拉低 → NRF进入待机模式（先别工作）
     csn_high(); // CSN引脚拉高 → SPI片选无效（先别通信）
@@ -154,27 +188,64 @@ NRF24L01_Status NRF24L01_Init(void)
         return NRF24L01_SPI_ERROR;
     }
 		
-    /* Match the front car's one-way telemetry mode (no auto-ack). */
-    write_register(NRF_REG_EN_AA, 0x00U);
+    write_register(NRF_REG_EN_AA, 0x01U);
     write_register(NRF_REG_EN_RXADDR, 0x01U);//只使能管道0(Pipe0)接收数据
     write_register(NRF_REG_SETUP_AW, 0x03U);
-    write_register(NRF_REG_SETUP_RETR, 0x00U);//自动重传 关闭
+    write_register(NRF_REG_SETUP_RETR, 0x00U);
     write_register(NRF_REG_RF_CH, 40U);//无线频道 = 40号（2.4GHz + 40MHz = 2.440GHz）
     write_register(NRF_REG_RF_SETUP, 0x06U);
     write_register_buf(NRF_REG_RX_ADDR_P0, rx_address, 5U);
     write_register_buf(NRF_REG_TX_ADDR, rx_address, 5U);
     write_register(NRF_REG_RX_PW_P0, NRF24L01_PAYLOAD_SIZE);
-    write_register(NRF_REG_DYNPD, 0x00U);
-    write_register(NRF_REG_FEATURE, 0x00U);
+    write_register(NRF_REG_FEATURE, 0x06U);
+    if ((read_register(NRF_REG_FEATURE) & 0x06U) != 0x06U) {
+        (void)activate_features();
+        write_register(NRF_REG_FEATURE, 0x06U);
+    }
+    write_register(NRF_REG_DYNPD, 0x01U);
     write_register(NRF_REG_STATUS, NRF_STATUS_RX_DR | NRF_STATUS_TX_DS | NRF_STATUS_MAX_RT);
     send_command(NRF_CMD_FLUSH_RX);
 		//0x0F上电
     write_register(NRF_REG_CONFIG, 0x0FU);
     HAL_Delay(2);
+    if ((read_register(NRF_REG_FEATURE) & 0x06U) != 0x06U) {
+        return NRF24L01_SPI_ERROR;
+    }
+    (void)NRF24L01_QueueAckStatus(0U, NRF24L01_REAR_STATE_NORMAL, 0U);
     ce_high();
 
     module_ready = 1U;
     return NRF24L01_OK;
+}
+
+NRF24L01_Status NRF24L01_QueueAckStatus(uint8_t corner_id,
+                                       uint8_t rear_state,
+                                       uint32_t rear_path_ticks)
+{
+    uint8_t payload[NRF24L01_ACK_PAYLOAD_SIZE];
+    uint8_t checksum = 0U;
+    NRF24L01_Status ret;
+
+    payload[0] = NRF24L01_ACK_MAGIC;
+    payload[1] = corner_id;
+    payload[2] = rear_state;
+    payload[3] = ++ack_sequence;
+    payload[4] = (uint8_t)rear_path_ticks;
+    payload[5] = (uint8_t)(rear_path_ticks >> 8);
+    payload[6] = (uint8_t)(rear_path_ticks >> 16);
+    payload[7] = (uint8_t)(rear_path_ticks >> 24);
+    for (uint8_t i = 0U; i < (NRF24L01_ACK_PAYLOAD_SIZE - 1U); i++) {
+        checksum = (uint8_t)(checksum + payload[i]);
+    }
+    payload[8] = checksum;
+
+    ce_low();
+    ret = send_command(NRF_CMD_FLUSH_TX);
+    if (ret == NRF24L01_OK) {
+        ret = write_ack_payload(payload, NRF24L01_ACK_PAYLOAD_SIZE);
+    }
+    ce_high();
+    return ret;
 }
 
 NRF24L01_Status NRF24L01_ReadPacket(NRF24L01_Packet *packet)
