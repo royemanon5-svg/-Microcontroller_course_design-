@@ -82,6 +82,9 @@ typedef struct {
 #define FOLLOW_RIGHT_ANGLE_GYRO_TARGET_DEG 76.0f//73
 #define FOLLOW_RIGHT_ANGLE_STOP_ERROR_DEG 3.0f
 #define FOLLOW_RIGHT_ANGLE_SETTLE_N 5U
+#define FOLLOW_RIGHT_ANGLE_MAX_PWM 145
+#define FOLLOW_RIGHT_ANGLE_MIN_PWM 125
+#define FOLLOW_RIGHT_ANGLE_BRAKE_ANGLE_DEG 35.0f
 #define FRONT_YAW_SIGN          1.0f
 #define REAR_YAW_SIGN           1.0f
 #define FOLLOW_CONTROL_MS       10U
@@ -97,8 +100,8 @@ typedef struct {
 #define REAR_PATH_SCALE_NUM     223U
 #define REAR_PATH_SCALE_DEN     225U
 #define FOLLOW_PLAYBACK_DELAY_MM 200U //150
-#define FOLLOW_RIGHT_ANGLE_EXTRA_MM 0U
-#define FOLLOW_CORNER_HOLD_MAX_MM 220.0f
+#define FOLLOW_RIGHT_ANGLE_EXTRA_MM 40U
+#define FOLLOW_CORNER_HOLD_MAX_MM 150.0f
 #define FOLLOW_CORNER_RESTART_DISTANCE_CM 25U
 #define FOLLOW_CORNER_CATCHUP_PWM 100
 #define FOLLOW_RIGHT_ANGLE_EXTRA_TICKS \
@@ -924,10 +927,13 @@ static void RearCar_ControlTask(void)
         } else {
             right_angle_settle_count = 0U;
             right_angle_turn_pwm = (right_angle_error > 0.0f) ?
-                                   TURN_MAX_PWM : -TURN_MAX_PWM;
-            if (right_angle_error_abs <= FOLLOW_TURN_BRAKE_ANGLE_DEG) {
+                                   FOLLOW_RIGHT_ANGLE_MAX_PWM :
+                                   -FOLLOW_RIGHT_ANGLE_MAX_PWM;
+            if (right_angle_error_abs <=
+                FOLLOW_RIGHT_ANGLE_BRAKE_ANGLE_DEG) {
                 right_angle_turn_pwm = (right_angle_error > 0.0f) ?
-                                       TURN_MIN_PWM : -TURN_MIN_PWM;
+                                       FOLLOW_RIGHT_ANGLE_MIN_PWM :
+                                       -FOLLOW_RIGHT_ANGLE_MIN_PWM;
             }
         }
 

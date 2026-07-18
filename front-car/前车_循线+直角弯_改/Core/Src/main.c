@@ -45,6 +45,12 @@
 #define CROSS_STRAIGHT_TARGET_SPEED 20
 #define CROSS_DETECT_ACTIVE_N       6U
 #define CROSS_DETECT_CONFIRM_N      2U
+#define CORNER_EXIT_CROSS_ACTIVE_N  4U
+#define CORNER_EXIT_CROSS_CONFIRM_N 1U
+#define CROSS_ARM_AFTER_CORNER_MM    100U
+#define ROUTE_EXPECT_CORNER          0U
+#define ROUTE_EXPECT_CROSS_FIRST     1U
+#define ROUTE_EXPECT_CROSS_SECOND    2U
 #define CROSS_EXIT_CONFIRM_N        3U
 #define CROSS_MIN_TRAVEL_MM         30U
 #define CROSS_MAX_TRAVEL_MM         120U
@@ -52,6 +58,8 @@
     ((CROSS_MIN_TRAVEL_MM * 530634U + 141372U / 2U) / 141372U)
 #define CROSS_MAX_TRAVEL_TICKS \
     ((CROSS_MAX_TRAVEL_MM * 530634U + 141372U / 2U) / 141372U)
+#define CROSS_ARM_AFTER_CORNER_TICKS \
+    ((CROSS_ARM_AFTER_CORNER_MM * 530634U + 141372U / 2U) / 141372U)
 #define CORNER_EXIT_ADVANCE_MM       400U
 #define CORNER_EXIT_TARGET_SPEED     15
 #define CORNER_WAIT_TIMEOUT_MS       8000U
@@ -110,9 +118,11 @@ volatile uint8_t  turn_lost_line = 0;
 volatile uint32_t corner_lock = 0;
 volatile uint8_t  corner_dir = 0;    // 0=左转 1=右转
 volatile uint8_t  cross_active = 0U;
+volatile uint8_t  special_route_phase = ROUTE_EXPECT_CORNER;
 volatile uint8_t  cross_detect_count = 0U;
 volatile uint8_t  cross_exit_count = 0U;
 volatile uint32_t cross_start_path_ticks = 0U;
+volatile uint32_t cross_last_exit_path_ticks = 0U;
 volatile uint8_t  corner_id = 0U;
 volatile uint32_t corner_exit_start_ticks = 0U;
 volatile uint32_t corner_wait_start_ms = 0U;
@@ -307,6 +317,7 @@ int main(void)
                 PID_SpeedL.integral = 0; PID_SpeedR.integral = 0;
                 OLED_Clear();
                 corner_exit_start_ticks = g_path_ticks;
+                special_route_phase = ROUTE_EXPECT_CROSS_FIRST;
                 OLED_ShowString(1, 1, "Corner exit");
                 step = 4;
             }
@@ -782,15 +793,23 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             right_active += (SENSOR_R3 != GPIO_PIN_RESET) ? 1U : 0U;
             right_active += (SENSOR_R4 != GPIO_PIN_RESET) ? 1U : 0U;
             total_active = (uint8_t)(left_active + right_active);
-            cross_pattern = ((total_active >= CROSS_DETECT_ACTIVE_N) &&
-                             (left_active >= 2U) &&
-                             (right_active >= 2U)) ? 1U : 0U;
+            cross_pattern =
+                ((special_route_phase != ROUTE_EXPECT_CORNER) &&
+                 (((special_route_phase == ROUTE_EXPECT_CROSS_FIRST) &&
+                   ((g_path_ticks - corner_exit_start_ticks) >=
+                    CROSS_ARM_AFTER_CORNER_TICKS)) ||
+                  ((special_route_phase == ROUTE_EXPECT_CROSS_SECOND) &&
+                   ((g_path_ticks - cross_last_exit_path_ticks) >=
+                    CROSS_ARM_AFTER_CORNER_TICKS))) &&
+                 (total_active >= CORNER_EXIT_CROSS_ACTIVE_N) &&
+                 (left_active >= 1U) &&
+                 (right_active >= 1U)) ? 1U : 0U;
 
             if (cross_active == 0U)
             {
                 if (cross_pattern != 0U)
                 {
-                    if (cross_detect_count < CROSS_DETECT_CONFIRM_N)
+                    if (cross_detect_count < CORNER_EXIT_CROSS_CONFIRM_N)
                     {
                         cross_detect_count++;
                     }
@@ -800,7 +819,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                     cross_detect_count = 0U;
                 }
 
-                if (cross_detect_count >= CROSS_DETECT_CONFIRM_N)
+                if (cross_detect_count >= CORNER_EXIT_CROSS_CONFIRM_N)
                 {
                     cross_active = 1U;
                     cross_detect_count = 0U;
@@ -841,6 +860,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                     (cross_travel_ticks >= CROSS_MAX_TRAVEL_TICKS))
                 {
                     cross_active = 0U;
+                    cross_last_exit_path_ticks = g_path_ticks;
+                    special_route_phase =
+                        (special_route_phase == ROUTE_EXPECT_CROSS_FIRST) ?
+                        ROUTE_EXPECT_CROSS_SECOND : ROUTE_EXPECT_CORNER;
                     cross_exit_count = 0U;
                     corner_lock = HAL_GetTick() + CORNER_LOCK_MS;
                     Tracking_Reset();
@@ -848,8 +871,15 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             }
             else
             {
-                // 角检测：8路总和低于阈值 → 直角
-                if ((int32_t)(HAL_GetTick() - corner_lock) >= 0)
+                // 固定顺序：直角弯、十字第一次、十字第二次，然后循环。
+                if (((int32_t)(HAL_GetTick() - corner_lock) >= 0) &&
+                    ((special_route_phase == ROUTE_EXPECT_CORNER) ||
+                     ((special_route_phase == ROUTE_EXPECT_CROSS_FIRST) &&
+                      ((g_path_ticks - corner_exit_start_ticks) >=
+                       CROSS_ARM_AFTER_CORNER_TICKS)) ||
+                     ((special_route_phase == ROUTE_EXPECT_CROSS_SECOND) &&
+                      ((g_path_ticks - cross_last_exit_path_ticks) >=
+                       CROSS_ARM_AFTER_CORNER_TICKS))))
                 {
                     uint16_t sum = 0, sumL = 0, sumR = 0;
                     for (uint8_t i = 0; i < 4; i++) { sumL += adc_values[i]; sumR += adc_values[i+4]; }
@@ -865,16 +895,36 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                     if (corner_det > 1)
                     {
                         corner_det = 0;
-                        turn_ticks = 0;
-                        corner_id = (corner_id >= 15U) ? 1U :
-                                    (uint8_t)(corner_id + 1U);
-                        g_rear_ack_valid = 0U;
-                        OLED_Clear();
-                        OLED_ShowString(1, 1, corner_dir ? "TURN RIGHT" : "TURN LEFT");
-                        step = 2;
+                        if (special_route_phase != ROUTE_EXPECT_CORNER)
+                        {
+                            cross_active = 1U;
+                            cross_detect_count = 0U;
+                            cross_exit_count = 0U;
+                            cross_start_path_ticks = g_path_ticks;
+                            Tracking_Reset();
+                        }
+                        else
+                        {
+                            turn_ticks = 0;
+                            corner_id = (corner_id >= 15U) ? 1U :
+                                        (uint8_t)(corner_id + 1U);
+                            g_rear_ack_valid = 0U;
+                            OLED_Clear();
+                            OLED_ShowString(1, 1, corner_dir ? "TURN RIGHT" : "TURN LEFT");
+                            step = 2;
+                        }
                     }
                 }
-                debug_pos = (int16_t)Tracking_Task((int16_t *)Target_speed);
+                if (cross_active != 0U)
+                {
+                    Target_speed[0] = CROSS_STRAIGHT_TARGET_SPEED;
+                    Target_speed[1] = CROSS_STRAIGHT_TARGET_SPEED;
+                    debug_pos = 0;
+                }
+                else
+                {
+                    debug_pos = (int16_t)Tracking_Task((int16_t *)Target_speed);
+                }
             }
             int16_t out_L = PID_Caculate(&PID_SpeedL, (float)Target_speed[0] - last_speedL);
             int16_t out_R = PID_Caculate(&PID_SpeedR, (float)Target_speed[1] - last_speedR);
@@ -926,16 +976,105 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             int16_t speed_reduction;
             int16_t out_L;
             int16_t out_R;
+            uint8_t left_active = 0U;
+            uint8_t right_active = 0U;
+            uint8_t total_active;
+            uint8_t cross_pattern;
 
-            debug_pos = (int16_t)Tracking_Task((int16_t *)Target_speed);
-            average_speed = (int16_t)(((int32_t)Target_speed[0] +
-                                       Target_speed[1]) / 2);
-            if (average_speed > CORNER_EXIT_TARGET_SPEED)
+            left_active += (SENSOR_L4 != GPIO_PIN_RESET) ? 1U : 0U;
+            left_active += (SENSOR_L3 != GPIO_PIN_RESET) ? 1U : 0U;
+            left_active += (SENSOR_L2 != GPIO_PIN_RESET) ? 1U : 0U;
+            left_active += (SENSOR_L1 != GPIO_PIN_RESET) ? 1U : 0U;
+            right_active += (SENSOR_R1 != GPIO_PIN_RESET) ? 1U : 0U;
+            right_active += (SENSOR_R2 != GPIO_PIN_RESET) ? 1U : 0U;
+            right_active += (SENSOR_R3 != GPIO_PIN_RESET) ? 1U : 0U;
+            right_active += (SENSOR_R4 != GPIO_PIN_RESET) ? 1U : 0U;
+            total_active = (uint8_t)(left_active + right_active);
+            cross_pattern = ((special_route_phase != ROUTE_EXPECT_CORNER) &&
+                             (((special_route_phase == ROUTE_EXPECT_CROSS_FIRST) &&
+                               ((g_path_ticks - corner_exit_start_ticks) >=
+                                CROSS_ARM_AFTER_CORNER_TICKS)) ||
+                              ((special_route_phase == ROUTE_EXPECT_CROSS_SECOND) &&
+                               ((g_path_ticks - cross_last_exit_path_ticks) >=
+                                CROSS_ARM_AFTER_CORNER_TICKS))) &&
+                             (total_active >= CORNER_EXIT_CROSS_ACTIVE_N) &&
+                             (left_active >= 1U) &&
+                             (right_active >= 1U)) ? 1U : 0U;
+
+            if (cross_active == 0U)
             {
-                speed_reduction = (int16_t)(average_speed -
-                                             CORNER_EXIT_TARGET_SPEED);
-                Target_speed[0] = (int16_t)(Target_speed[0] - speed_reduction);
-                Target_speed[1] = (int16_t)(Target_speed[1] - speed_reduction);
+                if (cross_pattern != 0U)
+                {
+                    if (cross_detect_count < CORNER_EXIT_CROSS_CONFIRM_N)
+                    {
+                        cross_detect_count++;
+                    }
+                }
+                else
+                {
+                    cross_detect_count = 0U;
+                }
+
+                if (cross_detect_count >= CORNER_EXIT_CROSS_CONFIRM_N)
+                {
+                    cross_active = 1U;
+                    cross_detect_count = 0U;
+                    cross_exit_count = 0U;
+                    cross_start_path_ticks = g_path_ticks;
+                    Tracking_Reset();
+                }
+            }
+
+            if (cross_active != 0U)
+            {
+                uint32_t cross_travel_ticks = g_path_ticks -
+                                              cross_start_path_ticks;
+
+                Target_speed[0] = CROSS_STRAIGHT_TARGET_SPEED;
+                Target_speed[1] = CROSS_STRAIGHT_TARGET_SPEED;
+                debug_pos = 0;
+
+                if (cross_travel_ticks >= CROSS_MIN_TRAVEL_TICKS)
+                {
+                    if ((center_on_line) &&
+                        (total_active > 0U) && (total_active <= 4U))
+                    {
+                        if (cross_exit_count < CROSS_EXIT_CONFIRM_N)
+                        {
+                            cross_exit_count++;
+                        }
+                    }
+                    else
+                    {
+                        cross_exit_count = 0U;
+                    }
+                }
+
+                if ((cross_exit_count >= CROSS_EXIT_CONFIRM_N) ||
+                    (cross_travel_ticks >= CROSS_MAX_TRAVEL_TICKS))
+                {
+                    cross_active = 0U;
+                    cross_last_exit_path_ticks = g_path_ticks;
+                    special_route_phase =
+                        (special_route_phase == ROUTE_EXPECT_CROSS_FIRST) ?
+                        ROUTE_EXPECT_CROSS_SECOND : ROUTE_EXPECT_CORNER;
+                    cross_exit_count = 0U;
+                    corner_lock = HAL_GetTick() + CORNER_LOCK_MS;
+                    Tracking_Reset();
+                }
+            }
+            else
+            {
+                debug_pos = (int16_t)Tracking_Task((int16_t *)Target_speed);
+                average_speed = (int16_t)(((int32_t)Target_speed[0] +
+                                           Target_speed[1]) / 2);
+                if (average_speed > CORNER_EXIT_TARGET_SPEED)
+                {
+                    speed_reduction = (int16_t)(average_speed -
+                                                 CORNER_EXIT_TARGET_SPEED);
+                    Target_speed[0] = (int16_t)(Target_speed[0] - speed_reduction);
+                    Target_speed[1] = (int16_t)(Target_speed[1] - speed_reduction);
+                }
             }
             out_L = PID_Caculate(&PID_SpeedL,
                                   (float)Target_speed[0] - last_speedL);
@@ -945,8 +1084,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             g_motor_cmd_right = out_R;
             Motor_SetPWM(out_L, out_R);
 
-            if ((g_path_ticks - corner_exit_start_ticks) >=
-                CORNER_EXIT_ADVANCE_TICKS)
+            if ((cross_active == 0U) && (cross_detect_count == 0U) &&
+                ((g_path_ticks - corner_exit_start_ticks) >=
+                 CORNER_EXIT_ADVANCE_TICKS))
             {
                 g_motor_cmd_left = 0;
                 g_motor_cmd_right = 0;

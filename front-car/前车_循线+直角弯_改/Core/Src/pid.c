@@ -10,7 +10,7 @@ extern UART_HandleTypeDef huart1;
 #define MAX_SPEED           50
 #define MIN_SPEED           -50
 #define MAX_CORRECTION      20
-#define TRACK_BASE_SPEED    25 //20
+#define TRACK_BASE_SPEED    15 //25
 
 extern float ErrorLInt, ErrorRInt;
 
