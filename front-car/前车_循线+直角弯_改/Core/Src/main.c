@@ -42,7 +42,29 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
+#define CROSS_STRAIGHT_TARGET_SPEED 20
+#define CROSS_DETECT_ACTIVE_N       6U
+#define CROSS_DETECT_CONFIRM_N      2U
+#define CORNER_EXIT_CROSS_ACTIVE_N  4U
+#define CORNER_EXIT_CROSS_CONFIRM_N 1U
+#define CROSS_ARM_AFTER_CORNER_MM    100U
+#define ROUTE_EXPECT_CORNER          0U
+#define ROUTE_EXPECT_CROSS_FIRST     1U
+#define ROUTE_EXPECT_CROSS_SECOND    2U
+#define CROSS_EXIT_CONFIRM_N        3U
+#define CROSS_MIN_TRAVEL_MM         30U
+#define CROSS_MAX_TRAVEL_MM         120U
+#define CROSS_MIN_TRAVEL_TICKS \
+    ((CROSS_MIN_TRAVEL_MM * 530634U + 141372U / 2U) / 141372U)
+#define CROSS_MAX_TRAVEL_TICKS \
+    ((CROSS_MAX_TRAVEL_MM * 530634U + 141372U / 2U) / 141372U)
+#define CROSS_ARM_AFTER_CORNER_TICKS \
+    ((CROSS_ARM_AFTER_CORNER_MM * 530634U + 141372U / 2U) / 141372U)
+#define CORNER_EXIT_ADVANCE_MM       400U
+#define CORNER_EXIT_TARGET_SPEED     15
+#define CORNER_WAIT_TIMEOUT_MS       8000U
+#define CORNER_EXIT_ADVANCE_TICKS \
+    ((CORNER_EXIT_ADVANCE_MM * 530634U + 141372U / 2U) / 141372U)
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -69,6 +91,8 @@ volatile int16_t g_left = 0;
 volatile int16_t g_right = 0;
 volatile int16_t g_motor_cmd_left = 0;
 volatile int16_t g_motor_cmd_right = 0;
+volatile uint32_t g_path_ticks = 0U;
+volatile uint8_t g_path_half_tick = 0U;
 volatile uint8_t g_nrf_ready = 0;
 volatile uint8_t g_nrf_tx_ok = 0;
 volatile uint8_t g_turning = 0;
@@ -93,6 +117,18 @@ volatile uint16_t turn_ticks = 0;
 volatile uint8_t  turn_lost_line = 0;
 volatile uint32_t corner_lock = 0;
 volatile uint8_t  corner_dir = 0;    // 0=左转 1=右转
+volatile uint8_t  cross_active = 0U;
+volatile uint8_t  special_route_phase = ROUTE_EXPECT_CORNER;
+volatile uint8_t  cross_detect_count = 0U;
+volatile uint8_t  cross_exit_count = 0U;
+volatile uint32_t cross_start_path_ticks = 0U;
+volatile uint32_t cross_last_exit_path_ticks = 0U;
+volatile uint8_t  corner_id = 0U;
+volatile uint32_t corner_exit_start_ticks = 0U;
+volatile uint32_t corner_wait_start_ms = 0U;
+volatile uint8_t  g_rear_ack_valid = 0U;
+volatile uint8_t  g_rear_ack_corner_id = 0U;
+volatile uint8_t  g_rear_ack_state = NRF24L01_REAR_STATE_NORMAL;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -190,33 +226,69 @@ int main(void)
     // OLED 显示 8 路 + 总和（调试用）
     {
         char t[18];
+        uint32_t distance_mm = (uint32_t)((((uint64_t)g_path_ticks * 141372U) +
+                                           265317U) / 530634U);
+        int32_t yaw_x10 = (int32_t)(Yaw_GetAngle() * 10.0f);
+        uint32_t yaw_abs_x10 = (yaw_x10 < 0) ?
+                               (uint32_t)(-yaw_x10) : (uint32_t)yaw_x10;
         sprintf(t, "L%4d%4d%4d%4d", adc_values[0], adc_values[1], adc_values[2], adc_values[3]);
         OLED_ShowString(3, 1, t);
-        sprintf(t, "R%4d%4d%4d%4d", adc_values[4], adc_values[5], adc_values[6], adc_values[7]);
-        OLED_ShowString(4, 1, t);
+        OLED_ShowString(4, 1, "                ");
+        OLED_ShowString(4, 1, "D");
+        OLED_ShowNum(4, 2, (distance_mm + 5U) / 10U, 4);
+        OLED_ShowString(4, 6, "Y");
+        OLED_ShowString(4, 7, (yaw_x10 < 0) ? "-" : "+");
+        OLED_ShowNum(4, 8, yaw_abs_x10 / 10U, 3);
+        OLED_ShowString(4, 11, ".");
+        OLED_ShowNum(4, 12, yaw_abs_x10 % 10U, 1);
     }
     {
         static uint32_t last_nrf_retry = 0U;
+        static uint32_t last_nrf_send = 0U;
+        uint32_t now = HAL_GetTick();
         int16_t left = g_motor_cmd_left;
         int16_t right = g_motor_cmd_right;
         int16_t speed = (int16_t)(((int32_t)left + right) / 2);
         int16_t turn = (int16_t)(((int32_t)right - left) / 2);
         int16_t yaw_x10 = (int16_t)(Yaw_GetAngle() * 10.0f);
+        uint8_t flags = 0U;
         char radio_text[18];
+
+        if (step == 2U) flags = FRONT_CAR_FLAG_CORNER_APPROACH;
+        else if (step == 3U) flags = FRONT_CAR_FLAG_RIGHT_ANGLE;
+        else if (step == 4U) flags = FRONT_CAR_FLAG_CORNER_EXIT;
+        else if (step == 5U) flags = FRONT_CAR_FLAG_WAIT_REAR;
+        if ((step >= 2U) && (step <= 5U))
+        {
+            flags |= (uint8_t)((corner_id << FRONT_CAR_CORNER_ID_SHIFT) &
+                               FRONT_CAR_CORNER_ID_MASK);
+        }
 
         sprintf(radio_text, "V:%4d T:%4d", speed, turn);
         OLED_ShowString(1, 1, radio_text);
 
         if (g_nrf_ready)
         {
-            g_nrf_tx_ok = (NRF24L01_SendCarData(speed, turn, yaw_x10) == NRF24L01_TX_OK);
+            if ((uint32_t)(now - last_nrf_send) >= 20U)
+            {
+                last_nrf_send = now;
+                NRF24L01_RearAck rear_ack;
+                g_nrf_tx_ok = (NRF24L01_SendCarData(speed, turn, yaw_x10,
+                                                    g_path_ticks, flags) ==
+                                   NRF24L01_TX_OK);
+                if ((g_nrf_tx_ok != 0U) &&
+                    (NRF24L01_GetRearAck(&rear_ack, 300U) != 0U))
+                {
+                    g_rear_ack_valid = 1U;
+                    g_rear_ack_corner_id = rear_ack.corner_id;
+                    g_rear_ack_state = rear_ack.rear_state;
+                }
+            }
             OLED_ShowString(2, 1, g_nrf_tx_ok ? "RF:OK Q:   " : "RF:ERR Q:  ");
             OLED_ShowNum(2, 9, NRF24L01_LastSequence(), 3);
         }
         else
         {
-            uint32_t now = HAL_GetTick();
-
             if ((uint32_t)(now - last_nrf_retry) >= 500U)
             {
                 last_nrf_retry = now;
@@ -244,8 +316,10 @@ int main(void)
                 corner_lock = HAL_GetTick() + CORNER_LOCK_MS;
                 PID_SpeedL.integral = 0; PID_SpeedR.integral = 0;
                 OLED_Clear();
-                OLED_ShowString(1, 1, "Tracking...");
-                step = 1;
+                corner_exit_start_ticks = g_path_ticks;
+                special_route_phase = ROUTE_EXPECT_CROSS_FIRST;
+                OLED_ShowString(1, 1, "Corner exit");
+                step = 4;
             }
         }
         else line_detect_count = 0;
@@ -681,33 +755,177 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         ADC_ReadAll();
         last_speedL = Get_Encoder_Speed(&htim3);
         last_speedR = Get_Encoder_Speed(&htim4);
+        last_speedR = (int16_t)(-(int32_t)last_speedR);
+        {
+            uint16_t left_ticks = (last_speedL < 0) ?
+                                  (uint16_t)(-(int32_t)last_speedL) :
+                                  (uint16_t)last_speedL;
+            uint16_t right_ticks = (last_speedR < 0) ?
+                                   (uint16_t)(-(int32_t)last_speedR) :
+                                   (uint16_t)last_speedR;
+            uint32_t tick_sum = (uint32_t)left_ticks + right_ticks +
+                                g_path_half_tick;
+            if (step != 3U)
+            {
+                g_path_ticks += tick_sum / 2U;
+                g_path_half_tick = (uint8_t)(tick_sum & 1U);
+            }
+            else
+            {
+                g_path_half_tick = 0U;
+            }
+        }
         Yaw_Update();
 
         if (step == 1)
         {
-            // 角检测：8路总和低于阈值 → 直角
-            if ((int32_t)(HAL_GetTick() - corner_lock) >= 0)
+            uint8_t left_active = 0U;
+            uint8_t right_active = 0U;
+            uint8_t total_active;
+            uint8_t cross_pattern;
+
+            left_active += (SENSOR_L4 != GPIO_PIN_RESET) ? 1U : 0U;
+            left_active += (SENSOR_L3 != GPIO_PIN_RESET) ? 1U : 0U;
+            left_active += (SENSOR_L2 != GPIO_PIN_RESET) ? 1U : 0U;
+            left_active += (SENSOR_L1 != GPIO_PIN_RESET) ? 1U : 0U;
+            right_active += (SENSOR_R1 != GPIO_PIN_RESET) ? 1U : 0U;
+            right_active += (SENSOR_R2 != GPIO_PIN_RESET) ? 1U : 0U;
+            right_active += (SENSOR_R3 != GPIO_PIN_RESET) ? 1U : 0U;
+            right_active += (SENSOR_R4 != GPIO_PIN_RESET) ? 1U : 0U;
+            total_active = (uint8_t)(left_active + right_active);
+            cross_pattern =
+                ((special_route_phase != ROUTE_EXPECT_CORNER) &&
+                 (((special_route_phase == ROUTE_EXPECT_CROSS_FIRST) &&
+                   ((g_path_ticks - corner_exit_start_ticks) >=
+                    CROSS_ARM_AFTER_CORNER_TICKS)) ||
+                  ((special_route_phase == ROUTE_EXPECT_CROSS_SECOND) &&
+                   ((g_path_ticks - cross_last_exit_path_ticks) >=
+                    CROSS_ARM_AFTER_CORNER_TICKS))) &&
+                 (total_active >= CORNER_EXIT_CROSS_ACTIVE_N) &&
+                 (left_active >= 1U) &&
+                 (right_active >= 1U)) ? 1U : 0U;
+
+            if (cross_active == 0U)
             {
-                uint16_t sum = 0, sumL = 0, sumR = 0;
-                for (uint8_t i = 0; i < 4; i++) { sumL += adc_values[i]; sumR += adc_values[i+4]; }
-                sum = sumL + sumR;
-                if (sum < CORNER_SUM_THRESH)
+                if (cross_pattern != 0U)
                 {
-                    int16_t diff = (int16_t)(sumL - sumR);
-                    if      (diff < -200) { corner_dir = 0; corner_det++; }
-                    else if (diff >  200) { corner_dir = 1; corner_det++; }
+                    if (cross_detect_count < CORNER_EXIT_CROSS_CONFIRM_N)
+                    {
+                        cross_detect_count++;
+                    }
                 }
-                else { corner_det = 0; }
-                if (corner_det > 1)
+                else
                 {
-                    corner_det = 0;
-                    turn_ticks = 0;
-                    OLED_Clear();
-                    OLED_ShowString(1, 1, corner_dir ? "TURN RIGHT" : "TURN LEFT");
-                    step = 2;
+                    cross_detect_count = 0U;
+                }
+
+                if (cross_detect_count >= CORNER_EXIT_CROSS_CONFIRM_N)
+                {
+                    cross_active = 1U;
+                    cross_detect_count = 0U;
+                    cross_exit_count = 0U;
+                    cross_start_path_ticks = g_path_ticks;
+                    corner_det = 0U;
+                    Tracking_Reset();
                 }
             }
-            debug_pos = (int16_t)Tracking_Task((int16_t *)Target_speed);
+
+            if (cross_active != 0U)
+            {
+                uint32_t cross_travel_ticks = g_path_ticks -
+                                              cross_start_path_ticks;
+
+                Target_speed[0] = CROSS_STRAIGHT_TARGET_SPEED;
+                Target_speed[1] = CROSS_STRAIGHT_TARGET_SPEED;
+                debug_pos = 0;
+                corner_det = 0U;
+
+                if (cross_travel_ticks >= CROSS_MIN_TRAVEL_TICKS)
+                {
+                    if ((center_on_line) &&
+                        (total_active > 0U) && (total_active <= 4U))
+                    {
+                        if (cross_exit_count < CROSS_EXIT_CONFIRM_N)
+                        {
+                            cross_exit_count++;
+                        }
+                    }
+                    else
+                    {
+                        cross_exit_count = 0U;
+                    }
+                }
+
+                if ((cross_exit_count >= CROSS_EXIT_CONFIRM_N) ||
+                    (cross_travel_ticks >= CROSS_MAX_TRAVEL_TICKS))
+                {
+                    cross_active = 0U;
+                    cross_last_exit_path_ticks = g_path_ticks;
+                    special_route_phase =
+                        (special_route_phase == ROUTE_EXPECT_CROSS_FIRST) ?
+                        ROUTE_EXPECT_CROSS_SECOND : ROUTE_EXPECT_CORNER;
+                    cross_exit_count = 0U;
+                    corner_lock = HAL_GetTick() + CORNER_LOCK_MS;
+                    Tracking_Reset();
+                }
+            }
+            else
+            {
+                // 固定顺序：直角弯、十字第一次、十字第二次，然后循环。
+                if (((int32_t)(HAL_GetTick() - corner_lock) >= 0) &&
+                    ((special_route_phase == ROUTE_EXPECT_CORNER) ||
+                     ((special_route_phase == ROUTE_EXPECT_CROSS_FIRST) &&
+                      ((g_path_ticks - corner_exit_start_ticks) >=
+                       CROSS_ARM_AFTER_CORNER_TICKS)) ||
+                     ((special_route_phase == ROUTE_EXPECT_CROSS_SECOND) &&
+                      ((g_path_ticks - cross_last_exit_path_ticks) >=
+                       CROSS_ARM_AFTER_CORNER_TICKS))))
+                {
+                    uint16_t sum = 0, sumL = 0, sumR = 0;
+                    for (uint8_t i = 0; i < 4; i++) { sumL += adc_values[i]; sumR += adc_values[i+4]; }
+                    sum = sumL + sumR;
+                    if (sum < CORNER_SUM_THRESH)
+                    {
+                        int16_t diff = (int16_t)(sumL - sumR);
+                        if      (diff < -200) { corner_dir = 0; corner_det++; }
+                        else if (diff >  200) { corner_dir = 1; corner_det++; }
+                        else                  { corner_det = 0; }
+                    }
+                    else { corner_det = 0; }
+                    if (corner_det > 1)
+                    {
+                        corner_det = 0;
+                        if (special_route_phase != ROUTE_EXPECT_CORNER)
+                        {
+                            cross_active = 1U;
+                            cross_detect_count = 0U;
+                            cross_exit_count = 0U;
+                            cross_start_path_ticks = g_path_ticks;
+                            Tracking_Reset();
+                        }
+                        else
+                        {
+                            turn_ticks = 0;
+                            corner_id = (corner_id >= 15U) ? 1U :
+                                        (uint8_t)(corner_id + 1U);
+                            g_rear_ack_valid = 0U;
+                            OLED_Clear();
+                            OLED_ShowString(1, 1, corner_dir ? "TURN RIGHT" : "TURN LEFT");
+                            step = 2;
+                        }
+                    }
+                }
+                if (cross_active != 0U)
+                {
+                    Target_speed[0] = CROSS_STRAIGHT_TARGET_SPEED;
+                    Target_speed[1] = CROSS_STRAIGHT_TARGET_SPEED;
+                    debug_pos = 0;
+                }
+                else
+                {
+                    debug_pos = (int16_t)Tracking_Task((int16_t *)Target_speed);
+                }
+            }
             int16_t out_L = PID_Caculate(&PID_SpeedL, (float)Target_speed[0] - last_speedL);
             int16_t out_R = PID_Caculate(&PID_SpeedR, (float)Target_speed[1] - last_speedR);
             g_motor_cmd_left = out_L;
@@ -751,6 +969,156 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             g_motor_cmd_left = L;
             g_motor_cmd_right = R;
             Motor_SetPWM(L, R);
+        }
+        else if (step == 4)
+        {
+            int16_t average_speed;
+            int16_t speed_reduction;
+            int16_t out_L;
+            int16_t out_R;
+            uint8_t left_active = 0U;
+            uint8_t right_active = 0U;
+            uint8_t total_active;
+            uint8_t cross_pattern;
+
+            left_active += (SENSOR_L4 != GPIO_PIN_RESET) ? 1U : 0U;
+            left_active += (SENSOR_L3 != GPIO_PIN_RESET) ? 1U : 0U;
+            left_active += (SENSOR_L2 != GPIO_PIN_RESET) ? 1U : 0U;
+            left_active += (SENSOR_L1 != GPIO_PIN_RESET) ? 1U : 0U;
+            right_active += (SENSOR_R1 != GPIO_PIN_RESET) ? 1U : 0U;
+            right_active += (SENSOR_R2 != GPIO_PIN_RESET) ? 1U : 0U;
+            right_active += (SENSOR_R3 != GPIO_PIN_RESET) ? 1U : 0U;
+            right_active += (SENSOR_R4 != GPIO_PIN_RESET) ? 1U : 0U;
+            total_active = (uint8_t)(left_active + right_active);
+            cross_pattern = ((special_route_phase != ROUTE_EXPECT_CORNER) &&
+                             (((special_route_phase == ROUTE_EXPECT_CROSS_FIRST) &&
+                               ((g_path_ticks - corner_exit_start_ticks) >=
+                                CROSS_ARM_AFTER_CORNER_TICKS)) ||
+                              ((special_route_phase == ROUTE_EXPECT_CROSS_SECOND) &&
+                               ((g_path_ticks - cross_last_exit_path_ticks) >=
+                                CROSS_ARM_AFTER_CORNER_TICKS))) &&
+                             (total_active >= CORNER_EXIT_CROSS_ACTIVE_N) &&
+                             (left_active >= 1U) &&
+                             (right_active >= 1U)) ? 1U : 0U;
+
+            if (cross_active == 0U)
+            {
+                if (cross_pattern != 0U)
+                {
+                    if (cross_detect_count < CORNER_EXIT_CROSS_CONFIRM_N)
+                    {
+                        cross_detect_count++;
+                    }
+                }
+                else
+                {
+                    cross_detect_count = 0U;
+                }
+
+                if (cross_detect_count >= CORNER_EXIT_CROSS_CONFIRM_N)
+                {
+                    cross_active = 1U;
+                    cross_detect_count = 0U;
+                    cross_exit_count = 0U;
+                    cross_start_path_ticks = g_path_ticks;
+                    Tracking_Reset();
+                }
+            }
+
+            if (cross_active != 0U)
+            {
+                uint32_t cross_travel_ticks = g_path_ticks -
+                                              cross_start_path_ticks;
+
+                Target_speed[0] = CROSS_STRAIGHT_TARGET_SPEED;
+                Target_speed[1] = CROSS_STRAIGHT_TARGET_SPEED;
+                debug_pos = 0;
+
+                if (cross_travel_ticks >= CROSS_MIN_TRAVEL_TICKS)
+                {
+                    if ((center_on_line) &&
+                        (total_active > 0U) && (total_active <= 4U))
+                    {
+                        if (cross_exit_count < CROSS_EXIT_CONFIRM_N)
+                        {
+                            cross_exit_count++;
+                        }
+                    }
+                    else
+                    {
+                        cross_exit_count = 0U;
+                    }
+                }
+
+                if ((cross_exit_count >= CROSS_EXIT_CONFIRM_N) ||
+                    (cross_travel_ticks >= CROSS_MAX_TRAVEL_TICKS))
+                {
+                    cross_active = 0U;
+                    cross_last_exit_path_ticks = g_path_ticks;
+                    special_route_phase =
+                        (special_route_phase == ROUTE_EXPECT_CROSS_FIRST) ?
+                        ROUTE_EXPECT_CROSS_SECOND : ROUTE_EXPECT_CORNER;
+                    cross_exit_count = 0U;
+                    corner_lock = HAL_GetTick() + CORNER_LOCK_MS;
+                    Tracking_Reset();
+                }
+            }
+            else
+            {
+                debug_pos = (int16_t)Tracking_Task((int16_t *)Target_speed);
+                average_speed = (int16_t)(((int32_t)Target_speed[0] +
+                                           Target_speed[1]) / 2);
+                if (average_speed > CORNER_EXIT_TARGET_SPEED)
+                {
+                    speed_reduction = (int16_t)(average_speed -
+                                                 CORNER_EXIT_TARGET_SPEED);
+                    Target_speed[0] = (int16_t)(Target_speed[0] - speed_reduction);
+                    Target_speed[1] = (int16_t)(Target_speed[1] - speed_reduction);
+                }
+            }
+            out_L = PID_Caculate(&PID_SpeedL,
+                                  (float)Target_speed[0] - last_speedL);
+            out_R = PID_Caculate(&PID_SpeedR,
+                                  (float)Target_speed[1] - last_speedR);
+            g_motor_cmd_left = out_L;
+            g_motor_cmd_right = out_R;
+            Motor_SetPWM(out_L, out_R);
+
+            if ((cross_active == 0U) && (cross_detect_count == 0U) &&
+                ((g_path_ticks - corner_exit_start_ticks) >=
+                 CORNER_EXIT_ADVANCE_TICKS))
+            {
+                g_motor_cmd_left = 0;
+                g_motor_cmd_right = 0;
+                Target_speed[0] = 0;
+                Target_speed[1] = 0;
+                Motor_SetPWM(0, 0);
+                corner_wait_start_ms = HAL_GetTick();
+                step = 5;
+            }
+        }
+        else if (step == 5)
+        {
+            g_motor_cmd_left = 0;
+            g_motor_cmd_right = 0;
+            Target_speed[0] = 0;
+            Target_speed[1] = 0;
+            Motor_SetPWM(0, 0);
+
+            if (((g_rear_ack_valid != 0U) &&
+                 (g_rear_ack_corner_id == corner_id) &&
+                 (g_rear_ack_state == NRF24L01_REAR_STATE_DONE)) ||
+                ((uint32_t)(HAL_GetTick() - corner_wait_start_ms) >=
+                 CORNER_WAIT_TIMEOUT_MS))
+            {
+                Tracking_Reset();
+                corner_lock = HAL_GetTick() + CORNER_LOCK_MS;
+                PID_SpeedL.integral = 0;
+                PID_SpeedR.integral = 0;
+                PID_SpeedL.last_error = 0;
+                PID_SpeedR.last_error = 0;
+                step = 1;
+            }
         }
     }
 }

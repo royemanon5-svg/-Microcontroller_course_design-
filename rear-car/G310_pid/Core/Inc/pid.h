@@ -13,6 +13,12 @@
 #define angle_Kp 2.0f  //2.0
 #define angle_Ki 0.0f //0.00
 #define angle_Kd 2.5f //2.5
+// 跟车航向 PID（实际控制周期由调用参数传入）
+#define HEADING_PID_KP              3.0f //2.2f
+#define HEADING_PID_KI              0.08f
+#define HEADING_PID_KD              0.12f
+#define HEADING_PID_INTEGRAL_LIMIT  80.0f
+#define HEADING_PID_D_FILTER        0.20f
 //速度PID
 #define SpeedL_Kp 4.0f // 经验值，需根据电机特性调整 2.5
 #define SpeedL_Ki 0.8f // 1.3
@@ -45,6 +51,9 @@ void AnglePID_Disable(void);
 void AnglePID_Process(int16_t base_speed,
                       float target_angle,
                       int16_t *speed_left, int16_t *speed_right);
+void HeadingPID_Reset(void);
+float HeadingPID_Update(float target_angle, float current_angle,
+                        float dt_seconds, float output_limit);
 float Yaw_GetAngle(void);
 extern float gyroZ_offset;
 extern float gyroZ_bias_dynamic;

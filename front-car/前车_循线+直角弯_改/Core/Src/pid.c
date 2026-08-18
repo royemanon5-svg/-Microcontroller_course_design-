@@ -10,7 +10,7 @@ extern UART_HandleTypeDef huart1;
 #define MAX_SPEED           50
 #define MIN_SPEED           -50
 #define MAX_CORRECTION      20
-#define TRACK_BASE_SPEED    20
+#define TRACK_BASE_SPEED    15 //25
 
 extern float ErrorLInt, ErrorRInt;
 
@@ -89,7 +89,7 @@ int16_t GetWeightedPosition(void)
     }
     else
     {
-        last_valid_pos = sum / count + 40 ;
+        last_valid_pos = sum / count ;
         return last_valid_pos;
     }
 }
@@ -247,7 +247,8 @@ void Yaw_Update(void)
     // 当两轮都几乎静止时，陀螺仪读数就是纯零漂
     // last_speedL/R 是你已有的全局编码器速度变量
     extern volatile int16_t last_speedL, last_speedR;
-    if (abs(last_speedL) < 5 && abs(last_speedR) < 5)
+    if ((abs(last_speedL) < 5) && (abs(last_speedR) < 5) &&
+        (fabsf(gyroZ_raw_dps) < 1.5f))
     {
         still_cnt++;
         if (still_cnt > 30) // 静止超过300ms才更新，防止瞬间误判

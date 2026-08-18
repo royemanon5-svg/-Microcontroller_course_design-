@@ -79,7 +79,8 @@ void Yaw_Update(void)
     // 当两轮都几乎静止时，陀螺仪读数就是纯零漂
     // last_speedL/R 是你已有的全局编码器速度变量
     extern volatile int16_t last_speedL, last_speedR;
-    if (abs(last_speedL) < 5 && abs(last_speedR) < 5)
+    if ((abs(last_speedL) < 5) && (abs(last_speedR) < 5) &&
+        (fabsf(gyroZ_raw_dps) < 1.5f))
     {
         still_cnt++;
         if (still_cnt > 30) // 静止超过300ms才更新，防止瞬间误判
@@ -118,6 +119,73 @@ static float   angle_last_error = 0.0f; //上一次微分项
 static float   angle_last_derivative = 0.0f; //上一次经过低通滤波后的微分值
 static float angle_output_limit = ANGLE_OUTPUT_LIMIT; //角度环限速
 uint8_t angle_enabled = 0;
+
+static float heading_integral = 0.0f;
+static float heading_last_error = 0.0f;
+static float heading_derivative = 0.0f;
+static uint8_t heading_error_valid = 0U;
+
+float AngleError(float target, float current);
+
+void HeadingPID_Reset(void)
+{
+    heading_integral = 0.0f;
+    heading_last_error = 0.0f;
+    heading_derivative = 0.0f;
+    heading_error_valid = 0U;
+}
+
+float HeadingPID_Update(float target_angle, float current_angle,
+                        float dt_seconds, float output_limit)
+{
+    float error = AngleError(target_angle, current_angle);
+    float derivative = 0.0f;
+    float candidate_integral;
+    float output;
+
+    if ((dt_seconds <= 0.0f) || (output_limit <= 0.0f)) {
+        HeadingPID_Reset();
+        return 0.0f;
+    }
+
+    if (heading_error_valid != 0U) {
+        derivative = AngleError(error, heading_last_error) / dt_seconds;
+        heading_derivative += HEADING_PID_D_FILTER *
+                              (derivative - heading_derivative);
+    } else {
+        heading_error_valid = 1U;
+    }
+
+    candidate_integral = heading_integral + error * dt_seconds;
+    if (candidate_integral > HEADING_PID_INTEGRAL_LIMIT) {
+        candidate_integral = HEADING_PID_INTEGRAL_LIMIT;
+    } else if (candidate_integral < -HEADING_PID_INTEGRAL_LIMIT) {
+        candidate_integral = -HEADING_PID_INTEGRAL_LIMIT;
+    }
+
+    output = HEADING_PID_KP * error +
+             HEADING_PID_KI * candidate_integral +
+             HEADING_PID_KD * heading_derivative;
+
+    /* Do not accumulate integral while saturation would grow further. */
+    if (!(((output > output_limit) && (error > 0.0f)) ||
+          ((output < -output_limit) && (error < 0.0f)))) {
+        heading_integral = candidate_integral;
+    }
+
+    output = HEADING_PID_KP * error +
+             HEADING_PID_KI * heading_integral +
+             HEADING_PID_KD * heading_derivative;
+    if (output > output_limit) {
+        output = output_limit;
+    } else if (output < -output_limit) {
+        output = -output_limit;
+    }
+
+    heading_last_error = error;
+    return output;
+}
+
 void AnglePID_Init(void)
 {
     angle_integral      = 0.0f;
